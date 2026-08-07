@@ -188,11 +188,11 @@ Flash through the **UART** port (the right-hand USB-C, next to the silkscreen la
 not the `USB` one — it uses the onboard serial bridge and needs no mode juggling.
 
 ```bash
-arduino-cli compile --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=default" ~/Documents/Arduino/OneButtonRadioS3
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=default" ~/Documents/coding_experiments/naani_radio/OneButtonRadioS3
 ```
 
 ```bash
-arduino-cli upload --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=default" -p <PORT> ~/Documents/Arduino/OneButtonRadioS3
+arduino-cli upload --fqbn "esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=default" -p <PORT> ~/Documents/coding_experiments/naani_radio/OneButtonRadioS3
 ```
 
 Current build: 1.95 MB, 61% of the 3 MB app partition.
@@ -250,7 +250,7 @@ python3 -m venv ~/.venv-serial && ~/.venv-serial/bin/pip -q install pyserial
 ```
 
 ```bash
-~/.venv-serial/bin/python ~/Documents/Arduino/OneButtonRadioS3/mon.py 15 --reset
+~/.venv-serial/bin/python ~/Documents/coding_experiments/naani_radio/OneButtonRadioS3/mon.py 15 --reset
 ```
 
 `mon.py <seconds> [--reset]` — `--reset` pulses DTR/RTS to force a clean boot so you
@@ -357,7 +357,7 @@ a relay on the LAN so the RTT the ESP32 sees is ~1 ms.
 reinstalling or updating the library**, or the sketch will not compile:
 
 ```bash
-python3 ~/Documents/Arduino/patches/prefill_patch.py
+python3 ~/Documents/coding_experiments/naani_radio/patches/prefill_patch.py
 ```
 
 It adds three fields to the public `settings` struct:

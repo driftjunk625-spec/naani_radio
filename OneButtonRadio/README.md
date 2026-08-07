@@ -150,11 +150,11 @@ MP3 radio). Different API, so the sketch would need porting.
 Fill in `secrets.h` with your 2.4 GHz SSID and password first. Then:
 
 ```bash
-arduino-cli compile --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app" ~/Documents/Arduino/OneButtonRadio
+arduino-cli compile --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app" ~/Documents/coding_experiments/naani_radio/OneButtonRadio
 ```
 
 ```bash
-arduino-cli upload --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app,UploadSpeed=115200" -p /dev/cu.usbserial-56840042211 ~/Documents/Arduino/OneButtonRadio
+arduino-cli upload --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app,UploadSpeed=115200" -p /dev/cu.usbserial-56840042211 ~/Documents/coding_experiments/naani_radio/OneButtonRadio
 ```
 
 Two flags that are doing real work:

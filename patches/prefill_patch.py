@@ -32,6 +32,10 @@ updating the library, because that overwrites these files.
 import pathlib
 import sys
 
+# Deliberately outside this repo. Arduino resolves libraries from the sketchbook
+# (~/Documents/Arduino), so the library lives there even though the project lives
+# in coding_experiments/naani_radio. Check `arduino-cli config get directories.user`
+# if this path is ever wrong.
 LIB = pathlib.Path.home() / "Documents/Arduino/libraries/ESP32-audioI2S/src"
 
 H_ANCHOR = """        uint32_t BUFFER_TRESHOLD_HLS = UINT16_MAX; // Level at which the HLS-TS stream starts and is reloaded

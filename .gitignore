@@ -10,3 +10,6 @@ build/
 *.elf
 *.map
 __pycache__/
+
+# macOS
+.DS_Store
