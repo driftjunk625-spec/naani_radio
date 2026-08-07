@@ -3,7 +3,7 @@ import sys, time, serial
 # Set this to whichever port the board enumerates as.
 #   /dev/cu.usbserial-*  -> the "UART" port (CP210x/CH340 bridge)
 #   /dev/cu.usbmodem*    -> the "USB" port (native USB-Serial-JTAG, CDC)
-port = "/dev/cu.usbmodem1101"
+port = "/dev/cu.usbserial-0001"
 
 secs = float(sys.argv[1]) if len(sys.argv) > 1 else 10
 reset = "--reset" in sys.argv
