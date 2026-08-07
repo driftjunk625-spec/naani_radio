@@ -67,6 +67,12 @@ static const int PIN_RGB = 48;
 // 100 volume steps instead of the default 22, so the slider feels smooth.
 static const uint8_t VOLUME_STEPS = 100;
 
+// Periodic diagnostics. The decisive number is the input buffer fill: the
+// buffer holds ~40 s of audio at 128 kbps, so if it drains the network is not
+// keeping up, and if it stays full while audio still stutters the fault is on
+// the consuming side (loop starvation or I2S). Set to 0 for a quiet build.
+#define DIAG 1
+
 // ADC endpoints. The ADC does not reach a clean 0 or 4095, so the travel is
 // clipped slightly at both ends to guarantee true silence at the bottom and
 // full volume at the top.
@@ -78,10 +84,19 @@ static const int ADC_HIGH = 3900;
 Audio audio;
 
 static float    volumeFiltered  = 0.0f;
+static float    volumeAnchor    = -9999.0f;  // ADC value when volumeStep was last set
 static uint8_t  volumeStep      = 0;
 static uint32_t lastVolumePoll  = 0;
 static uint32_t lastStreamCheck = 0;
 static uint32_t reconnectDelay  = 2000;  // grows on repeated failure
+
+#if DIAG
+static uint32_t diagLoops    = 0;   // loop() iterations since the last report
+static uint32_t diagResyncs  = 0;   // decoder lost sync and had to re-find it
+static uint32_t diagVolWrites = 0;  // setVolume() calls, to catch ADC chatter
+static uint32_t lastDiag     = 0;
+static uint32_t bufMinPct    = 100; // low-water mark between reports
+#endif
 
 enum Status { ST_BOOT, ST_WIFI, ST_STREAM, ST_PLAYING, ST_ERROR };
 
@@ -117,12 +132,48 @@ static void pollVolume() {
   // still, which would otherwise make the volume chatter between steps.
   volumeFiltered += 0.2f * (raw - volumeFiltered);
 
+  // Hysteresis. One volume step spans (ADC_HIGH-ADC_LOW)/VOLUME_STEPS = ~38
+  // ADC counts, and the residual noise after smoothing is comparable, so a
+  // stationary slider still chattered across step boundaries - measured at
+  // 5-18 setVolume() calls per second with the slider untouched. Requiring
+  // three quarters of a step of real movement before acting silences that
+  // without any perceptible loss of resolution.
+  const float stepSpan = (float)(ADC_HIGH - ADC_LOW) / VOLUME_STEPS;
+  if (fabsf(volumeFiltered - volumeAnchor) < stepSpan * 0.75f) return;
+
   uint8_t step = adcToStep(volumeFiltered);
   if (step != volumeStep) {
+    volumeAnchor = volumeFiltered;
     volumeStep = step;
     audio.setVolume(volumeStep);
+#if DIAG
+    diagVolWrites++;
+#endif
   }
 }
+
+#if DIAG
+// One line every 2 s. Read it as: is the buffer draining (network), or is it
+// full while the audio still breaks up (consumer side)?
+static void reportDiag() {
+  if (millis() - lastDiag < 2000) return;
+  uint32_t elapsed = millis() - lastDiag;
+  lastDiag = millis();
+
+  uint32_t size = audio.getInBufferSize();
+  uint32_t pct  = size ? (audio.inBufferFilled() * 100 / size) : 0;
+
+  Serial.printf("diag buf=%3lu%% (min %3lu%%)  rssi=%4d  heap=%6u  psram=%7u  "
+                "loops/s=%5lu  resync=%lu  volwr=%lu\n",
+                pct, bufMinPct, WiFi.RSSI(), ESP.getFreeHeap(),
+                ESP.getFreePsram(), diagLoops * 1000 / max(elapsed, 1UL),
+                diagResyncs, diagVolWrites);
+
+  diagLoops = 0;
+  diagVolWrites = 0;
+  bufMinPct = 100;
+}
+#endif
 
 static bool connectWiFi(uint32_t timeoutMs) {
   if (WiFi.status() == WL_CONNECTED) return true;
@@ -189,6 +240,11 @@ void setup() {
 
   // Log everything the library reports - station name, bitrate, track titles.
   Audio::audio_info_callback = [](Audio::msg_t m) {
+#if DIAG
+    // "syncword found at pos N" means the decoder lost the bitstream and had
+    // to hunt for the next frame header. Each one is an audible glitch.
+    if (m.msg && strstr(m.msg, "syncword")) diagResyncs++;
+#endif
     Serial.printf("%s: %s\n", m.s ? m.s : "?", m.msg ? m.msg : "");
   };
 
@@ -210,6 +266,16 @@ void setup() {
 void loop() {
   audio.loop();  // must be called constantly - this is what feeds I2S
   pollVolume();
+
+#if DIAG
+  diagLoops++;
+  uint32_t sz = audio.getInBufferSize();
+  if (sz) {
+    uint32_t p = audio.inBufferFilled() * 100 / sz;
+    if (p < bufMinPct) bufMinPct = p;
+  }
+  reportDiag();
+#endif
 
   // Recover from a dropped stream or a dropped router, checked at a slow
   // cadence with backoff so a dead station does not spin the CPU.
