@@ -40,7 +40,10 @@
 // DNAS v2 think a browser is asking and 302-redirect to its web admin page
 // (/index.html?sid=1). The library follows that, gets HTML instead of audio,
 // and reconnect-loops forever. "/stream" (or "/;") forces the audio endpoint.
-const char *STATION_URL = "http://s8.voscast.com:7738/stream";
+// TEMPORARY A/B TEST: known-good, well-provisioned CDN at the same
+// 128 kbps MP3 as the station, to separate "this stream" from "this build".
+const char *STATION_URL = "http://ice1.somafm.com/groovesalad-128-mp3";
+// const char *STATION_URL = "http://s8.voscast.com:7738/stream";
 
 // Fallback for testing if the station is ever off air:
 // const char *STATION_URL = "http://ice1.somafm.com/groovesalad-128-mp3";
