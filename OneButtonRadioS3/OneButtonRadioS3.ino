@@ -24,22 +24,8 @@
 
 // ---------------------------------------------------------------- config
 
-// Radio Sharda 90.4 FM, Jammu - 128 kbps MP3 over plain HTTP.
+// Radio Sharda 90.4 FM, Jammu - 128 kbps MP3.
 //
-// This is the Shoutcast feed listed by OnlineRadioBox. Verified to be the same
-// broadcast as the radioindia.net feed by recording 30s of each simultaneously
-// and cross-correlating: peak 0.64 at a -11.4s lag (one sharp peak, so same
-// audio through a different CDN with ~11s more buffering).
-//
-// Preferred over https://radioindia.net/radio/sharda/icecast.audio because that
-// one is HTTPS-only (port 80 closed) *and* hotlink-protected - it 403s unless
-// the request carries "Referer: https://onlineradiofm.in/", and this library
-// has no way to set a custom Referer.
-// The "/stream" path is load-bearing. This library hardcodes a Chrome
-// user-agent (Audio.cpp:1071), so a bare "http://host:7738/" makes SHOUTcast
-// DNAS v2 think a browser is asking and 302-redirect to its web admin page
-// (/index.html?sid=1). The library follows that, gets HTML instead of audio,
-// and reconnect-loops forever. "/stream" (or "/;") forces the audio endpoint.
 // Use the station's own feed, NOT the voscast mirror. This is a throughput
 // decision, not a preference.
 //
@@ -60,8 +46,13 @@
 const char *STATION_URL = "https://radioindia.net/radio/sharda/icecast.audio";
 const char *STATION_REFERER = "https://onlineradiofm.in/";
 
-// Same station via voscast. Plain HTTP and no Referer needed, but only 1%
-// throughput headroom - it stutters. Kept for reference only.
+// Same station via voscast. Plain HTTP, no Referer needed, but only 1%
+// throughput headroom - it stutters. Kept for reference only. Note the
+// "/stream" path is load-bearing there: the library sends a Chrome
+// user-agent, so a bare "http://host:7738/" makes SHOUTcast DNAS v2 assume a
+// browser and 302 to its web admin page, and the stream reconnect-loops.
+// Confirmed the same broadcast by cross-correlating 30s of each feed: a
+// single sharp peak of 0.64 at -11.4s lag.
 // const char *STATION_URL = "http://s8.voscast.com:7738/stream";
 
 // I2S pins to the MAX98357A. GPIO 4/5/6/7 are adjacent on the header, so
@@ -82,6 +73,23 @@ static const int PIN_VOLUME = 4;
 // the back of your board reads v1.0). On v1.1 boards it moved to GPIO38.
 static const int PIN_RGB = 48;
 #define STATUS_LED 1  // set to 0 to keep the LED dark inside the enclosure
+
+// Tone control, in dB, -12.0 to +12.0 each. The library runs a 3-band IIR
+// (low shelf 500 Hz, peaking EQ 1800 Hz, high shelf 6000 Hz) and it is enabled
+// by default, so the biquads are already in the signal path at flat gain -
+// changing these costs no extra CPU at all, only a one-off coefficient recalc.
+//
+// Corner frequencies are tunable too, via audio.settings.FREQ_LS_HZ,
+// FREQ_PEAK_HZ and FREQ_HS_HZ, if 500/1800/6000 don't suit the speaker.
+//
+// CAUTION: a positive gain eats headroom. Boosting bass by +6 dB means the
+// signal clips 6 dB earlier, and on a small driver that arrives as distortion
+// long before it gets loud. On little speakers it is usually better to CUT the
+// band you dislike than to boost the one you want - cutting mids to tame
+// boxiness beats boosting bass the driver cannot physically reproduce.
+static const float TONE_BASS   = 0.0f;   // low shelf,  500 Hz
+static const float TONE_MID    = 0.0f;   // peaking EQ, 1800 Hz
+static const float TONE_TREBLE = 0.0f;   // high shelf, 6000 Hz
 
 // 100 volume steps instead of the default 22, so the slider feels smooth.
 static const uint8_t VOLUME_STEPS = 100;
@@ -315,6 +323,7 @@ void setup() {
   audio.setPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
   audio.setVolumeSteps(VOLUME_STEPS);
   audio.setVolumeCurve(volumeCurve);
+  audio.setTone(TONE_BASS, TONE_MID, TONE_TREBLE);
 
   // One speaker, so fold both channels together in software. This makes the
   // amp's SD channel-select pin irrelevant - nothing is lost either way.
