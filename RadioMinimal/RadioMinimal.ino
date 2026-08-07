@@ -29,7 +29,14 @@ static const int PIN_I2S_LRC  = 6;
 static const int PIN_I2S_DOUT = 7;
 static const int PIN_VOLUME   = 4;
 
-const char *STATION_URL = "http://ice1.somafm.com/groovesalad-128-mp3";
+// radioindia.net is the station's own feed and is 90ms closer than voscast:
+// 266ms RTT instead of 358ms. That matters because the ESP32's TCP receive
+// window is a hard 5760 bytes (CONFIG_LWIP_WND_SCALE is off), so throughput
+// is capped at window/RTT. voscast gives 16.1 KB/s against a 16.0 KB/s
+// stream - 1% headroom, no way to ever refill the buffer. radioindia gives
+// 21.6 KB/s, a 35% surplus, so the buffer can actually recover after a stall.
+// It is HTTPS-only and hotlink-protected, hence the Referer.
+const char *STATION_URL = "https://radioindia.net/radio/sharda/icecast.audio";
 
 // Bisection step 3. Step 2 was a botched test: it introduced BOTH pot polling
 // and setVolumeSteps(100) at once, so "the stutter is back" did not say which
@@ -146,6 +153,15 @@ void setup() {
   volumeStep = FIXED_VOLUME;
 #endif
 
+  // Bank the server's connect burst instead of spending it immediately.
+  // Measured: it hands out ~234 KB of surplus over the first ~4.6 s, then
+  // throttles to exactly real time. At 16 KB/s that surplus is ~14 s of
+  // cushion. Upstream starts decoding 1.5 KB in and throws it all away.
+  // Requires patches/prefill_patch.py to have been applied to the library.
+  audio.settings.REFERER = "https://onlineradiofm.in/";
+  audio.settings.PREFILL_BYTES = 200000;      // ~12.5 s of audio
+  audio.settings.PREFILL_TIMEOUT_MS = 8000;   // play anyway if it never fills
+
   audio.setPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
   audio.setVolumeSteps(VOLUME_STEPS);
   audio.setVolume(volumeStep);
@@ -167,6 +183,18 @@ void loop() {
     adcMax = 0; adcSum = 0; adcN = 0; loopGapMax = 0;
   }
 #endif
+
+  // Buffer trend. A steady decline means we consume faster than the server
+  // supplies; sudden drops mean discrete network stalls. Different fixes.
+  static uint32_t lastBufRep = 0;
+  if (millis() - lastBufRep > 2000) {
+    lastBufRep = millis();
+    uint32_t sz = audio.getInBufferSize();
+    uint32_t f  = audio.inBufferFilled();
+    Serial.printf("t=%4lus  buf=%7lu B (%2lu%%)  %5.1fs audio  rssi=%d\n",
+                  millis() / 1000, f, sz ? f * 100 / sz : 0, f / 16000.0, WiFi.RSSI());
+  }
+
   audio.loop();
 #if POLL_POT
   pollVolume();

@@ -40,11 +40,29 @@
 // DNAS v2 think a browser is asking and 302-redirect to its web admin page
 // (/index.html?sid=1). The library follows that, gets HTML instead of audio,
 // and reconnect-loops forever. "/stream" (or "/;") forces the audio endpoint.
-const char *STATION_URL = "http://s8.voscast.com:7738/stream";
+// Use the station's own feed, NOT the voscast mirror. This is a throughput
+// decision, not a preference.
+//
+// The ESP32's TCP receive window is a hard 5760 bytes: sdkconfig has
+// CONFIG_LWIP_TCP_WND_DEFAULT=5760 and CONFIG_LWIP_WND_SCALE unset, so it
+// cannot grow. TCP throughput is therefore capped at window/RTT, and both
+// servers are far away:
+//
+//   voscast     358ms RTT -> 16.1 KB/s  vs 16.0 KB/s needed = +1%  headroom
+//   radioindia  266ms RTT -> 21.6 KB/s  vs 16.0 KB/s needed = +35% headroom
+//
+// With +1% the buffer can never refill: measured draining from 98KB to 17KB
+// (1.1s of audio) and then stuttering permanently. With +35% it climbed to
+// 453KB (28s) in 85s and kept going. That is the whole difference.
+//
+// This feed is HTTPS-only (port 80 closed) and hotlink-protected - it 403s
+// without the Referer below, which needs patches/prefill_patch.py applied.
+const char *STATION_URL = "https://radioindia.net/radio/sharda/icecast.audio";
+const char *STATION_REFERER = "https://onlineradiofm.in/";
 
-// Known-good reference stream, same 128 kbps MP3. Useful for telling "this
-// station is misbehaving" apart from "this build is misbehaving".
-// const char *STATION_URL = "http://ice1.somafm.com/groovesalad-128-mp3";
+// Same station via voscast. Plain HTTP and no Referer needed, but only 1%
+// throughput headroom - it stutters. Kept for reference only.
+// const char *STATION_URL = "http://s8.voscast.com:7738/stream";
 
 // I2S pins to the MAX98357A. GPIO 4/5/6/7 are adjacent on the header, so
 // the amp wiring is one tidy run.
@@ -282,6 +300,17 @@ void setup() {
 #endif
     Serial.printf("%s: %s\n", m.s ? m.s : "?", m.msg ? m.msg : "");
   };
+
+  // These three need patches/prefill_patch.py applied to the library.
+  //
+  // The Referer is required by the hotlink-protected feed. The prefill banks
+  // a starting cushion instead of upstream's behaviour of beginning playback
+  // 1.5KB in: 64KB is ~4s of audio and costs ~3s of startup. It stays modest
+  // deliberately, because on this feed the buffer keeps growing during
+  // playback anyway - it does not need to be filled up front.
+  audio.settings.REFERER = STATION_REFERER;
+  audio.settings.PREFILL_BYTES = 64000;
+  audio.settings.PREFILL_TIMEOUT_MS = 8000;
 
   audio.setPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
   audio.setVolumeSteps(VOLUME_STEPS);

@@ -164,7 +164,9 @@ bridged (BTL), and grounding one side shorts half the output stage. At 5 V you g
 ## 3. Library and the PSRAM flag
 
 Installed at `~/Documents/Arduino/libraries/ESP32-audioI2S` — upstream
-schreibfaul1 **v4.0.0**, straight from master. No fork, no patches.
+schreibfaul1 **v4.0.0**, straight from master. No fork, but it **does** carry three
+small local patches applied by `patches/prefill_patch.py` — see §7d. Re-run that
+script after any library reinstall or the sketch will not compile.
 
 > **The `PSRAM=opi` build flag is mandatory and is not the default.**
 >
@@ -200,10 +202,15 @@ Current build: 1.95 MB, 61% of the 3 MB app partition.
 Configured station is **Radio Sharda 90.4 FM, Jammu**:
 
 ```
-http://s8.voscast.com:7738/stream
+https://radioindia.net/radio/sharda/icecast.audio     (Referer required)
 ```
 
-128 kbps MP3 over plain HTTP. Three things about how this was chosen:
+**This choice is about throughput, not preference — see §7.** The voscast mirror
+below is plain HTTP and needs no Referer, but it stutters permanently; this feed does
+not. Both are the same 128 kbps broadcast.
+
+The rest of this section is the history of how the station was tracked down, and why
+the voscast URL looked right at first:
 
 **Why not `radioindia.net`.** The player on `onlineradiofm.in` uses
 `https://radioindia.net/radio/sharda/icecast.audio`. That feed is HTTPS-only (port 80
@@ -282,3 +289,84 @@ blasting.
 
 If the stream or the router drops, the sketch reconnects on its own with backoff up to
 30 s.
+
+---
+
+## 7. The stuttering investigation
+
+Three separate faults, found in this order. Recorded because none of them are
+guessable and all three will bite again if the code is changed.
+
+### 7a. Periodic ~1 s stutter — the ADC
+
+Bisecting down to a bare "WiFi + connect + audio.loop()" build and adding pieces back
+identified `analogRead()` on the volume pot. **Not because it is slow** — measured at
+135 µs average, 223 µs worst, which is 0.3% of the loop. The cost is that
+`adc_oneshot_read()` acquires the SAR ADC power domain, RTC/analog circuitry the RF
+front end shares. Each read briefly disturbs WiFi.
+
+Fix: poll at 500 ms instead of 50 ms (`POLL_MS`). A rotary encoder would remove the
+ADC entirely and is the proper fix if this ever proves marginal; the tradeoff is that
+an encoder has no absolute position, so volume would reset on every power cycle.
+
+### 7b. Slider felt dead until the top — the volume curve
+
+The library's default taper is `dB = -112t³ + 172t² - 60`, which puts half travel at
+**−31 dB**, about 3% amplitude. Replaced via `setVolumeCurve()` with `33.22·log10(t)`,
+i.e. dB proportional to log2(position). Loudness roughly doubles per +10 dB, so half
+travel now sounds about half as loud.
+
+### 7c. Sporadic stutter that no amount of buffering fixed — TCP window vs RTT
+
+This was the real one, and it is a hard platform limit.
+
+```
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+# CONFIG_LWIP_WND_SCALE is not set        <- cannot grow at runtime
+```
+
+TCP throughput is bounded by `window / RTT`. With a fixed 5760-byte window:
+
+| Server | RTT | Max throughput | vs 16.0 KB/s needed |
+|---|---|---|---|
+| voscast | 358 ms | 16.1 KB/s | **+1%** |
+| SomaFM | 322 ms | 17.8 KB/s | +11% |
+| radioindia.net | 266 ms | 21.6 KB/s | **+35%** |
+
+At +1% headroom the buffer can never refill. Measured: it drained from 98 KB to
+17.7 KB (1.1 s of audio) and stayed there, glitching permanently — that floor is not
+equilibrium, it is starvation, because a decoder can only consume what arrives. On
+radioindia it climbed to 453 KB (28 s) in 85 seconds and kept going, a measured
+surplus of +4.25 KB/s.
+
+A MacBook on the same WiFi is smooth because macOS auto-tunes its window to hundreds
+of KB. The ESP32 cannot.
+
+**Consequences for changing station:** any stream must satisfy
+`5760 / RTT_seconds > bitrate_bytes_per_sec`, with real margin. Check with
+`ping <host>` before committing to a URL. A 64 kbps stream needs only 8 KB/s and would
+tolerate RTT up to ~700 ms; a 128 kbps stream needs RTT under ~300 ms.
+
+If you ever need a far-away high-bitrate station, the options are: rebuild the core
+with a larger window (PlatformIO with a custom sdkconfig, or ESP-IDF directly), or run
+a relay on the LAN so the RTT the ESP32 sees is ~1 ms.
+
+### 7d. Required library patches
+
+`patches/prefill_patch.py` modifies the installed ESP32-audioI2S. **Re-run it after
+reinstalling or updating the library**, or the sketch will not compile:
+
+```bash
+python3 ~/Documents/Arduino/patches/prefill_patch.py
+```
+
+It adds three fields to the public `settings` struct:
+
+- `PREFILL_BYTES` — bank this much input before playback starts. Upstream begins
+  decoding 1.5 KB in, so a live stream never accumulates a cushion.
+- `PREFILL_TIMEOUT_MS` — start anyway if a server does not burst.
+- `REFERER` — the radioindia feed is hotlink-protected and 403s without
+  `Referer: https://onlineradiofm.in/`. Upstream has no way to set one.
+
+The script is idempotent and fails loudly if a library update moves the code it
+anchors on.
