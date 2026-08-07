@@ -370,3 +370,64 @@ It adds three fields to the public `settings` struct:
 
 The script is idempotent and fails loudly if a library update moves the code it
 anchors on.
+
+---
+
+## 8. Web UI and setup portal
+
+Reachable at **http://naani.local** once the radio has joined a network. If mDNS
+doesn't resolve (Windows needs Bonjour; Android historically doesn't do `.local` at
+all), the IP is printed to serial at boot and shown on the page itself.
+
+**Measured cost of adding all of this:** 93 KB flash (61% → 64%) and 2.7 KB of static
+RAM. Requests serve in ~20 ms. There is no measurable effect on audio.
+
+### Why the async server specifically
+
+`ESPAsyncWebServer` handles requests in the AsyncTCP task, **not** in `loop()`. The
+synchronous `WebServer` library needs `server.handleClient()` inside `loop()`, which
+would block `audio.loop()` — and `audio.loop()` is what reads the network. That is the
+same class of bug as §7a, so the async server is not a preference here, it is the
+requirement.
+
+Handlers therefore never do anything slow. Rebooting and stream-switching set a flag
+that `loop()` acts on, so the HTTP response is actually delivered before the radio
+reboots or drops the connection.
+
+### Normal mode
+
+- **Tone** — bass/mid/treble sliders, −12…+12 dB, applied live and saved
+- **Buffer** — fill percentage and seconds of audio banked. This is the number that
+  matters if audio ever misbehaves again; see §7c
+- **Station** — change the stream URL. Applied immediately, no reboot
+- Live stream title, IP, RSSI, volume and bitrate, polled every 2 s
+
+### Setup portal (AP mode)
+
+If no network can be joined at boot — no saved credentials, or the saved network is
+gone — the radio raises an **open** SoftAP called `naani-radio-setup` instead of
+sitting dark. The status LED goes **magenta** so this state is visible without a
+serial cable.
+
+Join it, open any address, pick a network from the scanned list (or type it), enter
+the password, and it saves and reboots. The AP is open on purpose: it exists only to
+hand over credentials, and a password you'd have to look up defeats the point of a
+recovery portal. It is only up while the radio is unconfigured.
+
+### Where settings live
+
+NVS, under the namespace `naani`, via `Preferences`. `secrets.h` remains the
+compile-time fallback: NVS wins if set, so a fresh board with credentials compiled in
+still works, and anything entered through the portal overrides it thereafter.
+
+Writes happen **only on form submit**, never during playback, which preserves the
+"nothing is written to flash at runtime" property that makes cutting power mid-song
+safe.
+
+To forget saved credentials and force the portal, erase NVS:
+
+```bash
+esptool.py --port /dev/cu.usbserial-0001 erase_flash
+```
+
+(That erases the sketch too — reflash afterwards.)

@@ -18,9 +18,21 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <ESPAsyncWebServer.h>
 #include "Audio.h"
 
-#include "secrets.h"  // WIFI_SSID and WIFI_PASS live here
+#include "secrets.h"  // compile-time fallback credentials
+#include "webui.h"    // the two served pages
+
+// Reachable at http://naani.local once joined to a network.
+static const char *MDNS_NAME = "naani";
+
+// SoftAP raised when no network can be joined. Open on purpose: it exists only
+// to hand over credentials, and a password you would have to look up defeats
+// the point of a recovery portal. It is only up while unconfigured.
+static const char *AP_SSID = "naani-radio-setup";
 
 // ---------------------------------------------------------------- config
 
@@ -135,7 +147,57 @@ static uint32_t lastDiag     = 0;
 static uint32_t bufMinPct    = 100; // low-water mark between reports
 #endif
 
-enum Status { ST_BOOT, ST_WIFI, ST_STREAM, ST_PLAYING, ST_ERROR };
+enum Status { ST_BOOT, ST_WIFI, ST_STREAM, ST_PLAYING, ST_ERROR, ST_AP };
+
+// --------------------------------------------------------- persisted config
+//
+// Written to NVS only when a form is submitted, never during playback. That
+// keeps the "nothing is written to flash at runtime" property that makes
+// cutting power mid-song safe. NVS is power-fail safe by design anyway, but
+// there is no reason to be writing at all while the radio is just playing.
+Preferences prefs;
+
+static String cfgSsid, cfgPass, cfgUrl;
+static float  cfgBass, cfgMid, cfgTreble;
+
+static AsyncWebServer server(80);
+static bool   apMode = false;
+static String nowPlaying;          // latest ICY stream title
+static uint32_t nowBitrate = 0;
+static volatile bool pendingReboot = false;
+static volatile bool pendingRetune = false;
+
+static void loadConfig() {
+  prefs.begin("naani", true);                       // read-only
+  cfgSsid   = prefs.getString("ssid", WIFI_SSID);   // secrets.h is the fallback
+  cfgPass   = prefs.getString("pass", WIFI_PASS);
+  cfgUrl    = prefs.getString("url",  STATION_URL);
+  cfgBass   = prefs.getFloat("bass",   TONE_BASS);
+  cfgMid    = prefs.getFloat("mid",    TONE_MID);
+  cfgTreble = prefs.getFloat("treble", TONE_TREBLE);
+  prefs.end();
+}
+
+static void saveWiFi(const String &s, const String &p) {
+  prefs.begin("naani", false);
+  prefs.putString("ssid", s);
+  prefs.putString("pass", p);
+  prefs.end();
+}
+
+static void saveTone() {
+  prefs.begin("naani", false);
+  prefs.putFloat("bass", cfgBass);
+  prefs.putFloat("mid", cfgMid);
+  prefs.putFloat("treble", cfgTreble);
+  prefs.end();
+}
+
+static void saveUrl(const String &u) {
+  prefs.begin("naani", false);
+  prefs.putString("url", u);
+  prefs.end();
+}
 
 // ------------------------------------------------------------- functions
 
@@ -156,6 +218,7 @@ static void setStatus(Status s) {
     case ST_STREAM:  neopixelWrite(PIN_RGB, 0, 6, 24);  break;  // blue
     case ST_PLAYING: neopixelWrite(PIN_RGB, 0, 10, 0);  break;  // dim green
     case ST_ERROR:   neopixelWrite(PIN_RGB, 30, 0, 0);  break;  // red
+    case ST_AP:      neopixelWrite(PIN_RGB, 26, 0, 26); break;  // magenta: setup
   }
 #endif
 }
@@ -238,12 +301,13 @@ static void reportDiag() {
 
 static bool connectWiFi(uint32_t timeoutMs) {
   if (WiFi.status() == WL_CONNECTED) return true;
+  if (cfgSsid.isEmpty()) return false;
 
   setStatus(ST_WIFI);
-  Serial.printf("wifi: connecting to %s\n", WIFI_SSID);
+  Serial.printf("wifi: connecting to %s\n", cfgSsid.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);  // modem sleep causes audible stream dropouts
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
@@ -262,14 +326,132 @@ static bool connectWiFi(uint32_t timeoutMs) {
 
 static void startStream() {
   setStatus(ST_STREAM);
-  Serial.printf("stream: connecting to %s\n", STATION_URL);
-  if (audio.connecttohost(STATION_URL)) {
+  Serial.printf("stream: connecting to %s\n", cfgUrl.c_str());
+  if (audio.connecttohost(cfgUrl.c_str())) {
     reconnectDelay = 2000;
     setStatus(ST_PLAYING);
   } else {
     Serial.println("stream: connect failed");
     setStatus(ST_ERROR);
   }
+}
+
+// -------------------------------------------------------------- web server
+//
+// Handlers run in the AsyncTCP task, NOT in loop(). That is the whole reason
+// for using the async server: the synchronous one needs handleClient() inside
+// loop(), which would block audio.loop() - and audio.loop() is what reads the
+// network. Anything slow or blocking is therefore deferred to loop() via the
+// pendingReboot / pendingRetune flags rather than done inside a handler.
+
+static String jsonEscape(const String &in) {
+  String o;
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if (c == '\n' || c == '\r') o += ' ';
+    else if ((uint8_t)c < 0x20) continue;
+    else o += c;
+  }
+  return o;
+}
+
+static void startWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send_P(200, "text/html", apMode ? PAGE_SETUP : PAGE_MAIN);
+  });
+
+  // Async scan, so the handler never blocks waiting for the radio.
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *r) {
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_FAILED) { WiFi.scanNetworks(true); n = WIFI_SCAN_RUNNING; }
+    if (n == WIFI_SCAN_RUNNING) { r->send(200, "application/json", "{\"done\":false}"); return; }
+
+    String j = "{\"done\":true,\"nets\":[";
+    for (int i = 0; i < n && i < 20; i++) {
+      if (i) j += ',';
+      j += "{\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\",\"rssi\":" + WiFi.RSSI(i) +
+           ",\"open\":" + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false") + "}";
+    }
+    j += "]}";
+    WiFi.scanDelete();
+    WiFi.scanNetworks(true);   // refresh for next time
+    r->send(200, "application/json", j);
+  });
+
+  server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!r->hasParam("ssid", true)) { r->send(400, "text/plain", "ssid required"); return; }
+    String s = r->getParam("ssid", true)->value();
+    String p = r->hasParam("pass", true) ? r->getParam("pass", true)->value() : "";
+    saveWiFi(s, p);
+    Serial.printf("wifi: saved '%s', rebooting\n", s.c_str());
+    r->send(200, "application/json", "{\"ok\":true}");
+    pendingReboot = true;      // actually reboot from loop(), not here
+  });
+
+  server.on("/tone", HTTP_POST, [](AsyncWebServerRequest *r) {
+    auto g = [&](const char *k, float d) {
+      return r->hasParam(k, true) ? r->getParam(k, true)->value().toFloat() : d;
+    };
+    cfgBass   = constrain(g("bass",   cfgBass),   -12.0f, 12.0f);
+    cfgMid    = constrain(g("mid",    cfgMid),    -12.0f, 12.0f);
+    cfgTreble = constrain(g("treble", cfgTreble), -12.0f, 12.0f);
+    audio.setTone(cfgBass, cfgMid, cfgTreble);   // cheap: recomputes coefficients
+    saveTone();
+    r->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/station", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!r->hasParam("url", true)) { r->send(400, "text/plain", "url required"); return; }
+    cfgUrl = r->getParam("url", true)->value();
+    saveUrl(cfgUrl);
+    r->send(200, "application/json", "{\"ok\":true}");
+    pendingRetune = true;      // reconnect from loop()
+  });
+
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) {
+    uint32_t sz = audio.getInBufferSize();
+    uint32_t f  = sz ? audio.inBufferFilled() : 0;
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+      "{\"title\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"vol\":%u,\"br\":%lu,"
+      "\"bufpct\":%lu,\"bufsec\":%.1f,\"url\":\"%s\","
+      "\"bass\":%.0f,\"mid\":%.0f,\"treble\":%.0f}",
+      jsonEscape(nowPlaying).c_str(),
+      WiFi.localIP().toString().c_str(), WiFi.RSSI(), volumeStep,
+      nowBitrate / 1000, sz ? f * 100 / sz : 0, f / 16000.0,
+      jsonEscape(cfgUrl).c_str(), cfgBass, cfgMid, cfgTreble);
+    r->send(200, "application/json", buf);
+  });
+
+  server.onNotFound([](AsyncWebServerRequest *r) {
+    // In AP mode bounce everything to the portal, so a captive-portal probe
+    // or a mistyped path still lands somewhere useful.
+    if (apMode) r->send_P(200, "text/html", PAGE_SETUP);
+    else        r->send(404, "text/plain", "not found");
+  });
+
+  server.begin();
+}
+
+static void startMDNS() {
+  if (MDNS.begin(MDNS_NAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("mdns: http://%s.local\n", MDNS_NAME);
+  } else {
+    Serial.println("mdns: failed to start");
+  }
+}
+
+// No network could be joined - raise the setup portal instead of sitting dark.
+static void startAP() {
+  apMode = true;
+  setStatus(ST_AP);
+  WiFi.mode(WIFI_AP_STA);          // AP_STA so scanning still works
+  WiFi.softAP(AP_SSID);
+  WiFi.scanNetworks(true);         // kick off an async scan for the dropdown
+  Serial.printf("ap: '%s' at http://%s\n", AP_SSID,
+                WiFi.softAPIP().toString().c_str());
 }
 
 // ------------------------------------------------------------------ main
@@ -285,6 +467,10 @@ void setup() {
   // library will not work. See README section 3.
   Serial.printf("PSRAM: %u bytes free of %u\n",
                 ESP.getFreePsram(), ESP.getPsramSize());
+
+  loadConfig();
+  Serial.printf("config: ssid='%s' url='%s' tone %.0f/%.0f/%.0f\n",
+                cfgSsid.c_str(), cfgUrl.c_str(), cfgBass, cfgMid, cfgTreble);
 
   // 11dB attenuation gives the ADC its full ~0-3.3V range, which is what the
   // pot swings across when its top rail is on 3V3.
@@ -306,6 +492,13 @@ void setup() {
     // to hunt for the next frame header. Each one is an audible glitch.
     if (m.msg && strstr(m.msg, "syncword")) diagResyncs++;
 #endif
+    // Capture what the web UI wants to show, rather than re-deriving it.
+    // Substring, not equality: the library labels these "streamtitle" but
+    // "bitrate (b/s)", so an exact match on the latter silently never fires.
+    if (m.s && m.msg) {
+      if (strstr(m.s, "streamtitle")) nowPlaying = m.msg;
+      else if (strstr(m.s, "bitrate")) nowBitrate = atol(m.msg);
+    }
     Serial.printf("%s: %s\n", m.s ? m.s : "?", m.msg ? m.msg : "");
   };
 
@@ -323,7 +516,7 @@ void setup() {
   audio.setPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
   audio.setVolumeSteps(VOLUME_STEPS);
   audio.setVolumeCurve(volumeCurve);
-  audio.setTone(TONE_BASS, TONE_MID, TONE_TREBLE);
+  audio.setTone(cfgBass, cfgMid, cfgTreble);
 
   // One speaker, so fold both channels together in software. This makes the
   // amp's SD channel-select pin irrelevant - nothing is lost either way.
@@ -334,10 +527,41 @@ void setup() {
   audio.setVolume(volumeStep);
   Serial.printf("volume: %u/%u at power-on\n", volumeStep, VOLUME_STEPS);
 
-  if (connectWiFi(20000)) startStream();
+  if (connectWiFi(20000)) {
+    startMDNS();
+    startWebServer();
+    startStream();
+  } else {
+    // No usable credentials, or the saved network is gone. Rather than sit
+    // dark, raise a setup portal so the radio can be reconfigured without a
+    // laptop and a USB cable.
+    startAP();
+    startMDNS();        // naani.local resolves on the AP too
+    startWebServer();
+  }
 }
 
 void loop() {
+  // Deferred work from web handlers. Doing these inside an AsyncTCP handler
+  // would reboot or reconnect out from under the HTTP response.
+  if (pendingReboot) {
+    delay(400);            // let the response actually reach the browser
+    ESP.restart();
+  }
+  if (pendingRetune) {
+    pendingRetune = false;
+    Serial.printf("station: switching to %s\n", cfgUrl.c_str());
+    audio.stopSong();
+    nowPlaying = "";
+    startStream();
+  }
+
+  // In setup mode there is no stream to service; just keep the portal alive.
+  if (apMode) {
+    delay(10);
+    return;
+  }
+
   audio.loop();  // must be called constantly - this is what feeds I2S
   pollVolume();
 
