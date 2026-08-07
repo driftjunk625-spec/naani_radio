@@ -31,6 +31,11 @@ static const int PIN_I2S_LRC  = 6;
 static const int PIN_I2S_DOUT = 7;
 static const int PIN_VOLUME   = 4;
 
+// Onboard WS2812. GPIO48 on DevKitC-1 v1.0; GPIO38 on v1.1 boards.
+// Running from a power bank there is no serial, so this LED is the only
+// feedback that the sketch is alive and which test is currently playing.
+static const int PIN_RGB = 48;
+
 static const uint32_t SAMPLE_RATE = 44100;
 
 // 256 stereo frames per write. Small enough to stay responsive, large enough
@@ -80,8 +85,21 @@ static void silence(uint32_t ms) {
   }
 }
 
-static void say(const char *what) {
+static void led(uint8_t r, uint8_t g, uint8_t b) {
+  neopixelWrite(PIN_RGB, r, g, b);
+}
+
+// Announce a phase on serial (when tethered) and on the LED (when not).
+static void announce(const char *what, uint8_t r, uint8_t g, uint8_t b) {
+  led(r, g, b);
   Serial.printf("[%6lu ms] %-34s pot=%4d\n", millis(), what, analogRead(PIN_VOLUME));
+}
+
+// Blank the LED through the gaps so each phase reads as a distinct colour
+// rather than one long blur.
+static void gap(uint32_t ms) {
+  led(0, 0, 0);
+  silence(ms);
 }
 
 void setup() {
@@ -93,11 +111,21 @@ void setup() {
 
   analogSetPinAttenuation(PIN_VOLUME, ADC_11db);
 
+  // Three white blinks: the sketch booted and reached setup().
+  for (int i = 0; i < 3; i++) {
+    led(30, 30, 30); delay(120);
+    led(0, 0, 0);    delay(120);
+  }
+
   i2s.setPins(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
   if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE,
                  I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO)) {
     Serial.println("i2s.begin() FAILED - check the pin numbers above");
-    while (true) delay(1000);
+    // Fast red flashing forever, so the failure is obvious without serial.
+    while (true) {
+      led(40, 0, 0); delay(120);
+      led(0, 0, 0);  delay(120);
+    }
   }
   Serial.println("i2s ready\n");
 }
@@ -105,43 +133,45 @@ void setup() {
 void loop() {
   Serial.println("--- pass start ---");
 
-  // 1. Steady reference tone. Should be a pure, boring 1 kHz. Any rasp,
-  //    buzz or warble here means the problem is in hardware, not the stream.
-  say("1 kHz sine, 25%");
+  // 1. Steady reference tone (BLUE). Should be a pure, boring 1 kHz. Any
+  //    rasp, buzz or warble here means the problem is in hardware, not the
+  //    stream.
+  announce("1 kHz sine, 25%", 0, 6, 30);
   tone(1000, 1000, 3000, 0.25f, true, true);
-  silence(400);
+  gap(400);
 
-  // 2. Amplitude staircase. This is the single most diagnostic test: it finds
-  //    the level at which clean turns to distorted. If 6% and 12% are clean
-  //    but 50% and 100% buzz, you are clipping - lower GAIN or accept less
-  //    volume. Small speakers distort well before the amp does.
-  say("staircase 6%");   tone(1000, 1000, 1200, 0.06f, true, true); silence(200);
-  say("staircase 12%");  tone(1000, 1000, 1200, 0.12f, true, true); silence(200);
-  say("staircase 25%");  tone(1000, 1000, 1200, 0.25f, true, true); silence(200);
-  say("staircase 50%");  tone(1000, 1000, 1200, 0.50f, true, true); silence(200);
-  say("staircase 100%"); tone(1000, 1000, 1200, 1.00f, true, true); silence(600);
+  // 2. Amplitude staircase (GREEN, brightness tracking the amplitude). This
+  //    is the single most diagnostic test: it finds the level at which clean
+  //    turns to distorted. If the dim steps are clean but the bright ones
+  //    buzz, you are clipping - lower GAIN or accept less volume. Small
+  //    speakers distort well before the amp does.
+  announce("staircase 6%",   0,  3, 0); tone(1000, 1000, 1200, 0.06f, true, true); gap(200);
+  announce("staircase 12%",  0,  6, 0); tone(1000, 1000, 1200, 0.12f, true, true); gap(200);
+  announce("staircase 25%",  0, 12, 0); tone(1000, 1000, 1200, 0.25f, true, true); gap(200);
+  announce("staircase 50%",  0, 25, 0); tone(1000, 1000, 1200, 0.50f, true, true); gap(200);
+  announce("staircase 100%", 0, 50, 0); tone(1000, 1000, 1200, 1.00f, true, true); gap(600);
 
-  // 3. Sweep. Reveals clocking and sample-rate problems as warbling or
-  //    beating, and shows where the little speaker rolls off at each end.
-  say("sweep 100 Hz - 8 kHz");
+  // 3. Sweep (PURPLE). Reveals clocking and sample-rate problems as warbling
+  //    or beating, and shows where the little speaker rolls off at each end.
+  announce("sweep 100 Hz - 8 kHz", 20, 0, 30);
   tone(100, 8000, 5000, 0.25f, true, true);
-  silence(600);
+  gap(600);
 
-  // 4. Channel check. The amp mixes (L+R)/2, so BOTH bursts should be
-  //    audible and equally loud. If one is silent, SD is selecting a single
-  //    channel instead of the mono mix.
-  say("left channel only");
+  // 4. Channel check (CYAN then YELLOW). The amp mixes (L+R)/2, so BOTH
+  //    bursts should be audible and equally loud. If one is silent, SD is
+  //    selecting a single channel instead of the mono mix.
+  announce("left channel only", 0, 25, 25);
   tone(660, 660, 1500, 0.25f, true, false);
-  silence(300);
-  say("right channel only");
+  gap(300);
+  announce("right channel only", 28, 20, 0);
   tone(660, 660, 1500, 0.25f, false, true);
-  silence(300);
+  gap(300);
 
-  // 5. Low tone. Bass draws the most current, so this is where a sagging
-  //    breadboard rail shows up as stutter or reset.
-  say("120 Hz, 50% (current draw)");
+  // 5. Low tone (RED). Bass draws the most current, so this is where a
+  //    sagging supply shows up as stutter or reset.
+  announce("120 Hz, 50% (current draw)", 40, 0, 0);
   tone(120, 120, 2500, 0.50f, true, true);
 
   Serial.println("--- pass end ---\n");
-  silence(1500);
+  gap(1500);
 }
