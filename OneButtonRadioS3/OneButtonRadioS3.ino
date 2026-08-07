@@ -40,12 +40,10 @@
 // DNAS v2 think a browser is asking and 302-redirect to its web admin page
 // (/index.html?sid=1). The library follows that, gets HTML instead of audio,
 // and reconnect-loops forever. "/stream" (or "/;") forces the audio endpoint.
-// TEMPORARY A/B TEST: known-good, well-provisioned CDN at the same
-// 128 kbps MP3 as the station, to separate "this stream" from "this build".
-const char *STATION_URL = "http://ice1.somafm.com/groovesalad-128-mp3";
-// const char *STATION_URL = "http://s8.voscast.com:7738/stream";
+const char *STATION_URL = "http://s8.voscast.com:7738/stream";
 
-// Fallback for testing if the station is ever off air:
+// Known-good reference stream, same 128 kbps MP3. Useful for telling "this
+// station is misbehaving" apart from "this build is misbehaving".
 // const char *STATION_URL = "http://ice1.somafm.com/groovesalad-128-mp3";
 
 // I2S pins to the MAX98357A. GPIO 4/5/6/7 are adjacent on the header, so
@@ -70,11 +68,21 @@ static const int PIN_RGB = 48;
 // 100 volume steps instead of the default 22, so the slider feels smooth.
 static const uint8_t VOLUME_STEPS = 100;
 
-// Periodic diagnostics. The decisive number is the input buffer fill: the
-// buffer holds ~40 s of audio at 128 kbps, so if it drains the network is not
-// keeping up, and if it stays full while audio still stutters the fault is on
-// the consuming side (loop starvation or I2S). Set to 0 for a quiet build.
-#define DIAG 1
+// How often the pot is sampled. This is deliberately slow, and it is the fix
+// for the stuttering: analogRead() costs only ~135us of CPU, but
+// adc_oneshot_read() acquires the SAR ADC power domain, which is RTC/analog
+// circuitry shared with the RF front end. Every read briefly disturbs WiFi,
+// the network read in audio.loop() stalls, and because the library keeps only
+// about a second of buffer that stall is audible. At 50ms this stuttered
+// constantly; at 500ms it is clean and the slider still feels responsive.
+//
+// A rotary encoder would remove the ADC from the picture entirely and is the
+// proper fix if this ever proves marginal - see README section 7.
+static const uint32_t POLL_MS = 500;
+
+// Periodic diagnostics, off by default. Set to 1 to get a stats line every 2s
+// (buffer fill, RSSI, heap, loop rate, decoder resyncs, setVolume calls).
+#define DIAG 0
 
 // ADC endpoints. The ADC does not reach a clean 0 or 4095, so the travel is
 // clipped slightly at both ends to guarantee true silence at the bottom and
@@ -105,8 +113,17 @@ enum Status { ST_BOOT, ST_WIFI, ST_STREAM, ST_PLAYING, ST_ERROR };
 
 // ------------------------------------------------------------- functions
 
+// Only touches the LED when the state actually changes. neopixelWrite() drives
+// the RMT peripheral and blocks until the transfer completes, so there is no
+// reason to repeat it every couple of seconds for a state that has not moved.
 static void setStatus(Status s) {
 #if STATUS_LED
+  static Status last = ST_ERROR;
+  static bool   first = true;
+  if (!first && s == last) return;
+  first = false;
+  last = s;
+
   switch (s) {
     case ST_BOOT:    neopixelWrite(PIN_RGB, 8, 8, 8);  break;  // dim white
     case ST_WIFI:    neopixelWrite(PIN_RGB, 20, 8, 0);  break;  // amber
@@ -115,6 +132,21 @@ static void setStatus(Status s) {
     case ST_ERROR:   neopixelWrite(PIN_RGB, 30, 0, 0);  break;  // red
   }
 #endif
+}
+
+// Volume taper, in dB, for a position t of 0.0-1.0.
+//
+// The library's default is dB = -112t^3 + 172t^2 - 60, which puts half travel
+// at -31 dB - roughly 3% amplitude. That is why the slider felt dead until it
+// was near the top: nearly all of the useful range was crammed into the last
+// third of the stroke.
+//
+// Perceived loudness roughly doubles for every +10 dB, so making dB
+// proportional to log2(t) gives a control where half way sounds about half as
+// loud: 33.22*log10(t) == 10*log2(t). Half travel lands at -10 dB, a quarter
+// at -20 dB. The library clamps the result to -60 dB, so t=0 is true silence.
+static float volumeCurve(float t) {
+  return 33.22f * log10f(t);
 }
 
 // Map the smoothed ADC reading onto the 0..VOLUME_STEPS scale.
@@ -126,7 +158,7 @@ static uint8_t adcToStep(float adc) {
 }
 
 static void pollVolume() {
-  if (millis() - lastVolumePoll < 50) return;
+  if (millis() - lastVolumePoll < POLL_MS) return;
   lastVolumePoll = millis();
 
   int raw = analogRead(PIN_VOLUME);
@@ -253,6 +285,7 @@ void setup() {
 
   audio.setPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
   audio.setVolumeSteps(VOLUME_STEPS);
+  audio.setVolumeCurve(volumeCurve);
 
   // One speaker, so fold both channels together in software. This makes the
   // amp's SD channel-select pin irrelevant - nothing is lost either way.
@@ -271,11 +304,17 @@ void loop() {
   pollVolume();
 
 #if DIAG
+  // Sampled at 50ms, never per-iteration: inBufferFilled() takes a mutex the
+  // audio task also needs, so polling it every loop was real lock contention.
   diagLoops++;
-  uint32_t sz = audio.getInBufferSize();
-  if (sz) {
-    uint32_t p = audio.inBufferFilled() * 100 / sz;
-    if (p < bufMinPct) bufMinPct = p;
+  static uint32_t lastBufSample = 0;
+  if (millis() - lastBufSample >= 50) {
+    lastBufSample = millis();
+    uint32_t sz = audio.getInBufferSize();
+    if (sz) {
+      uint32_t p = audio.inBufferFilled() * 100 / sz;
+      if (p < bufMinPct) bufMinPct = p;
+    }
   }
   reportDiag();
 #endif

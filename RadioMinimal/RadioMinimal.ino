@@ -27,10 +27,92 @@
 static const int PIN_I2S_BCLK = 5;
 static const int PIN_I2S_LRC  = 6;
 static const int PIN_I2S_DOUT = 7;
+static const int PIN_VOLUME   = 4;
 
 const char *STATION_URL = "http://ice1.somafm.com/groovesalad-128-mp3";
 
+// Bisection step 3. Step 2 was a botched test: it introduced BOTH pot polling
+// and setVolumeSteps(100) at once, so "the stutter is back" did not say which
+// of the two caused it.
+//
+//   POLL_POT 0 -> setVolumeSteps(100) with a fixed volume, no analogRead at
+//                 all. Stutter here means the 100-step setting is at fault.
+//   POLL_POT 1 -> the same plus pot polling. Stutter only here means
+//                 analogRead() is at fault.
+#define POLL_POT 1
+#define MEASURE  0
+
+// Step 4. analogRead() measured at 135us avg / 223us worst - far too fast to
+// stall audio - so the ADC is probably not the culprit. The other thing
+// POLL_POT=1 introduced was setVolume() calls DURING playback. With the pot
+// noise crossing step boundaries a few times a second, the library's volume
+// ramp may be producing audible amplitude wobble.
+//
+//   APPLY_VOLUME 0 -> read the pot, compute the step, but never call
+//                     setVolume(). Clean here means setVolume-during-playback
+//                     is the cause, not the ADC.
+//   APPLY_VOLUME 1 -> also apply it (this is what stuttered).
+#define APPLY_VOLUME 1
+
+// Step 5 - candidate fix. analogRead() costs only ~135us of CPU, so the
+// problem is not time: adc_oneshot_read() acquires the SAR ADC power domain,
+// which is RTC/analog circuitry shared with the RF front end. Each read
+// briefly disturbs WiFi, the network read stalls, and with only ~1s of buffer
+// that is audible. Polling 5x less often should cut the disturbance
+// proportionally while keeping the knob perfectly usable at 4 Hz.
+#define POLL_MS 500
+
+static const uint8_t VOLUME_STEPS = 100;
+static const uint8_t FIXED_VOLUME = 76;  // matches what the slider read
+static const int ADC_LOW  = 120;
+static const int ADC_HIGH = 3900;
+
 Audio audio;
+
+static float   volumeFiltered = 0.0f;
+static float   volumeAnchor   = -9999.0f;
+static uint8_t volumeStep     = 0;
+static uint32_t lastPoll      = 0;
+#if MEASURE
+static volatile uint32_t adcMax = 0, adcSum = 0, adcN = 0;
+static uint32_t loopGapMax = 0, lastLoopUs = 0, lastRep = 0;
+#endif
+
+static uint8_t adcToStep(float adc) {
+  if (adc <= ADC_LOW) return 0;
+  if (adc >= ADC_HIGH) return VOLUME_STEPS;
+  return (uint8_t)lroundf((adc - ADC_LOW) / (float)(ADC_HIGH - ADC_LOW) * VOLUME_STEPS);
+}
+
+#if POLL_POT
+static void pollVolume() {
+  if (millis() - lastPoll < POLL_MS) return;
+  lastPoll = millis();
+
+#if MEASURE
+  uint32_t t0 = micros();
+  int raw = analogRead(PIN_VOLUME);
+  uint32_t dt = micros() - t0;
+  if (dt > adcMax) adcMax = dt;
+  adcSum += dt; adcN++;
+#else
+  int raw = analogRead(PIN_VOLUME);
+#endif
+  volumeFiltered += 0.2f * (raw - volumeFiltered);
+
+  const float stepSpan = (float)(ADC_HIGH - ADC_LOW) / VOLUME_STEPS;
+  if (fabsf(volumeFiltered - volumeAnchor) < stepSpan * 0.75f) return;
+
+  uint8_t step = adcToStep(volumeFiltered);
+  if (step != volumeStep) {
+    volumeAnchor = volumeFiltered;
+    volumeStep = step;
+#if APPLY_VOLUME
+    audio.setVolume(volumeStep);
+#endif
+  }
+}
+#endif
 
 void setup() {
   Serial.begin(115200);
@@ -43,13 +125,50 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) delay(200);
   Serial.printf("wifi ok, rssi %d\n", WiFi.RSSI());
 
+#if POLL_POT
+  analogSetPinAttenuation(PIN_VOLUME, ADC_11db);
+  volumeFiltered = analogRead(PIN_VOLUME);
+  for (int i = 0; i < 16; i++) {
+  #if MEASURE
+  uint32_t t0 = micros();
+  int raw = analogRead(PIN_VOLUME);
+  uint32_t dt = micros() - t0;
+  if (dt > adcMax) adcMax = dt;
+  adcSum += dt; adcN++;
+#else
+  int raw = analogRead(PIN_VOLUME);
+#endif
+  volumeFiltered += 0.2f * (raw - volumeFiltered);
+    delay(5);
+  }
+  volumeStep = adcToStep(volumeFiltered);
+#else
+  volumeStep = FIXED_VOLUME;
+#endif
+
   audio.setPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
-  audio.setVolume(12);  // fixed, mid-scale on the default 0-21 range
+  audio.setVolumeSteps(VOLUME_STEPS);
+  audio.setVolume(volumeStep);
+  Serial.printf("volume %u/%u  (POLL_POT=%d)\n", volumeStep, VOLUME_STEPS, POLL_POT);
 
   Serial.println("connecting");
   audio.connecttohost(STATION_URL);
 }
 
 void loop() {
+#if MEASURE
+  uint32_t nowUs = micros();
+  if (lastLoopUs && (nowUs - lastLoopUs) > loopGapMax) loopGapMax = nowUs - lastLoopUs;
+  lastLoopUs = nowUs;
+  if (millis() - lastRep > 2000) {
+    lastRep = millis();
+    Serial.printf("adc: max=%luus avg=%luus n=%lu | worst loop gap=%luus\n",
+                  adcMax, adcN ? adcSum/adcN : 0, adcN, loopGapMax);
+    adcMax = 0; adcSum = 0; adcN = 0; loopGapMax = 0;
+  }
+#endif
   audio.loop();
+#if POLL_POT
+  pollVolume();
+#endif
 }
