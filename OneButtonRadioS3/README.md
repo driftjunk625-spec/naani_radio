@@ -25,9 +25,45 @@ GPIOs are off-limits (below).
 
 ---
 
-## 1. Power — use both ports *on the 12 V module*
+## 1a. Power — breadboard prototype (USB-C power bank)
 
-Unchanged from the other build. The two USB ports are on the buck module, not the
+For bench work, skip the 12 V side entirely: feed the S3 from a USB-C power bank and
+run the amp off the board's own `5V` pin. Both hang off the breadboard rails.
+
+```
+power bank ──USB-C──► S3 board
+                        ├─ 5V  ──► red rail  ──► amp Vin
+                        ├─ GND ──► blue rail ──► amp GND, pot GND
+                        └─ 3V3 ─────────────────► pot VCC
+```
+
+The power bank is not the constraint — it supplies 2–3 A. The constraint is
+**breadboard contact resistance**. Each spring contact is tens of milliohms and the
+current crosses several, so a 1 A bass transient sags the rail and brownout-resets the
+ESP32. This is the classic breadboard audio failure.
+
+Two fixes make it a non-issue at sane volume on a small speaker:
+
+- **1000 µF electrolytic across the amp's Vin/GND, in the holes right beside the amp** —
+  not out on the rail. It supplies the transient locally so it never crosses the
+  contacts. Stripe to GND.
+- **A short, thick USB-C cable.** Thin charge-only cables sag the rail by themselves.
+
+If a 4 Ω speaker at full volume still resets the board, that isn't a fault — that is
+precisely what the 12 V build below exists to solve.
+
+**Never plug the power bank and the Mac in at the same time.** Both USB-C ports feed
+the same 5V rail, so you would be tying two supplies together. Use the Mac's UART port
+while testing (you get serial output), then switch to the bank.
+
+Amp `Vin` goes to **5V, never 3V3** — at 3.3 V you get a fraction of the output power
+and it clips early.
+
+---
+
+## 1b. Power — final build, 12 V
+
+Use both ports on the buck module. The two USB ports are on the buck module, not the
 ESP32.
 
 ```
@@ -40,9 +76,10 @@ ESP32.
                                                      black ─► MAX98357A GND
 ```
 
-Don't feed the amp from the board's `5V` pin. The MAX98357A pulls over 1 A on bass
-peaks, and routing that through the dev board's USB connector and thin 5V trace is the
-most common cause of this build browning out mid-song. Give the amp its own port, and
+In the *final* build, don't feed the amp from the board's `5V` pin. The MAX98357A pulls
+over 1 A on bass peaks, and routing that through the dev board's USB connector and thin
+5V trace is the most common cause of this build browning out mid-song. (On the
+breadboard it's fine at moderate volume — see §1a.) Give the amp its own port, and
 put a **1000 µF electrolytic plus a 0.1 µF ceramic across VIN/GND right at the amp**.
 
 The toggle goes in the **12 V line, before the buck module**, rated for at least
@@ -82,13 +119,18 @@ GPIO 4/5/6/7 sit next to each other on the header, so this is one tidy run.
 
 **GAIN**, if too quiet: 100 kΩ to GND = 12 dB, straight to GND = 15 dB. Start floating.
 
-**SD** is a mute *and* channel-select pin. Most breakouts have a 1 MΩ pullup that,
-against the chip's internal 100 kΩ pulldown, sits near 0.45 V — enabled, output is the
-(L+R)/2 mono mix. Leave it unconnected.
+**SD** is a mute *and* channel-select pin. Confirmed on your specific board: the SMD
+resistor beside the SD pin is marked **`105`** = 1 MΩ. Against the chip's internal
+100 kΩ pulldown that puts SD near 0.45 V — amp enabled, output is the (L+R)/2 mono mix.
+**Leave SD unconnected.**
 
-If you get silence with everything else right, your board lacks that pullup: add
-**1 MΩ from SD to VIN**. Tying SD straight to 3V3 also un-mutes but selects *left
-channel only*.
+(If you ever get silence with everything else right, measure SD against GND: it should
+read roughly 0.4–0.5 V. Tying SD straight to 3V3 also un-mutes, but selects *left
+channel only*.)
+
+Pin order on this board, left to right: `LRC · BCLK · DIN · GAIN · SD · GND · Vin`.
+Note `LRC` and `BCLK` are adjacent but in that order — easy to swap by accident. The
+7-pin header needs soldering; the pads ship bare.
 
 On this build it matters less than on the ESP32 one, because the sketch calls
 `audio.forceMono(true)` and folds both channels together in software before I2S. Even
@@ -96,8 +138,8 @@ in left-only mode you'd hear the full mix.
 
 ### Slide pot
 
-Your module is dual-gang: two wipers (OTA, OTB) sharing VCC and GND. Use one, ignore
-the other.
+Your module is an **HW-233** with two separate 3-pin headers: `OTA/VCC/GND` and
+`OTB/VCC/GND`. Use the first, leave the OTB header entirely unconnected.
 
 | Pot pin | Goes to |
 |---|---|
