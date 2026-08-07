@@ -1,0 +1,12 @@
+# WiFi credentials - never commit. Use secrets.h.example as the template.
+secrets.h
+
+# Third-party libraries, installed via the commands in the READMEs
+libraries/
+
+# Arduino build output
+build/
+*.bin
+*.elf
+*.map
+__pycache__/
