@@ -238,12 +238,68 @@ static float volumeCurve(float t) {
   return 33.22f * log10f(t);
 }
 
+// --------------------------------------------------------- tone + loudness
+//
+// Boosting a band raises the overall level, so without compensation the EQ
+// doubles as a second volume control - +6 dB of bass is audibly louder, not
+// just bassier. This estimates the broadband level change the three filters
+// cause and returns its negative, to be applied as makeup gain.
+//
+// The weights are how much each band contributes to *perceived* loudness, not
+// how much spectrum it covers. Mids carry the most because the ear is most
+// sensitive around 1-4 kHz; the high shelf sits at 6 kHz where there is little
+// programme energy. They sum to 1.0, so a uniform +6 dB across all three
+// returns exactly -6 dB and cancels.
+static const float W_BASS = 0.30f, W_MID = 0.45f, W_TREBLE = 0.25f;
+
+// Eight presets. Defined here rather than in the page so there is one source
+// of truth; the browser fetches them from /presets and renders the buttons.
+//
+// They lean on cuts more than boosts, because loudness compensation means a
+// boosted preset just pulls the volume down to match - you get the tonal shape
+// either way, and cutting keeps more headroom on a small driver.
+struct Preset { const char *name; float bass, mid, treble; };
+
+static const Preset PRESETS[] = {
+  { "Flat",         0,   0,   0 },
+  { "Speech",      -4,  +4,  +1 },   // talk radio: clear, no boom
+  { "Warm",        +3,   0,  -3 },   // soften a harsh or sibilant stream
+  { "Bright",      -2,   0,  +4 },   // lift detail on a dull recording
+  { "Bass boost",  +6,  -1,   0 },   // as much low end as the driver allows
+  { "Small spkr",  -3,  +2,  +3 },   // cut what a tiny cone cannot make anyway
+  { "Late night",  -2,  +3,  -2 },   // intelligible at very low volume
+  { "Loudness",    +4,  -2,  +3 },   // smiley curve for quiet listening
+};
+static const size_t N_PRESETS = sizeof(PRESETS) / sizeof(PRESETS[0]);
+
+static float toneMakeupDb() {
+  return -(W_BASS * cfgBass + W_MID * cfgMid + W_TREBLE * cfgTreble);
+}
+
 // Map the smoothed ADC reading onto the 0..VOLUME_STEPS scale.
 static uint8_t adcToStep(float adc) {
   if (adc <= ADC_LOW) return 0;
   if (adc >= ADC_HIGH) return VOLUME_STEPS;
   float span = (adc - ADC_LOW) / (float)(ADC_HIGH - ADC_LOW);
   return (uint8_t)lroundf(span * VOLUME_STEPS);
+}
+
+// Send the slider position to the library with the tone makeup folded in.
+//
+// The volume curve is dB = 33.22*log10(t) for t = step/steps, so shifting the
+// output by C dB means scaling t by 10^(C/33.22) - no need to touch the curve
+// itself. Clamping at 1.0 means a large cut cannot be fully made up when the
+// slider is already at maximum; that limit is real, you cannot amplify past
+// full scale. The other direction always works, and conveniently a boost
+// pulls the volume down, which is exactly the headroom you need to not clip.
+static void applyVolume() {
+  if (volumeStep == 0) { audio.setVolume(0); return; }
+
+  float t = (float)volumeStep / VOLUME_STEPS;
+  t *= powf(10.0f, toneMakeupDb() / 33.22f);
+  t = constrain(t, 0.0f, 1.0f);
+
+  audio.setVolume((uint8_t)lroundf(t * VOLUME_STEPS));
 }
 
 static void pollVolume() {
@@ -269,7 +325,7 @@ static void pollVolume() {
   if (step != volumeStep) {
     volumeAnchor = volumeFiltered;
     volumeStep = step;
-    audio.setVolume(volumeStep);
+    applyVolume();
 #if DIAG
     diagVolWrites++;
 #endif
@@ -397,6 +453,7 @@ static void startWebServer() {
     cfgMid    = constrain(g("mid",    cfgMid),    -12.0f, 12.0f);
     cfgTreble = constrain(g("treble", cfgTreble), -12.0f, 12.0f);
     audio.setTone(cfgBass, cfgMid, cfgTreble);   // cheap: recomputes coefficients
+    applyVolume();                               // re-apply makeup for the new curve
     saveTone();
     r->send(200, "application/json", "{\"ok\":true}");
   });
@@ -409,6 +466,17 @@ static void startWebServer() {
     pendingRetune = true;      // reconnect from loop()
   });
 
+  server.on("/presets", HTTP_GET, [](AsyncWebServerRequest *r) {
+    String j = "[";
+    for (size_t i = 0; i < N_PRESETS; i++) {
+      if (i) j += ',';
+      j += "{\"n\":\"" + String(PRESETS[i].name) + "\",\"b\":" + String(PRESETS[i].bass, 0) +
+           ",\"m\":" + String(PRESETS[i].mid, 0) + ",\"t\":" + String(PRESETS[i].treble, 0) + "}";
+    }
+    j += "]";
+    r->send(200, "application/json", j);
+  });
+
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) {
     uint32_t sz = audio.getInBufferSize();
     uint32_t f  = sz ? audio.inBufferFilled() : 0;
@@ -416,11 +484,11 @@ static void startWebServer() {
     snprintf(buf, sizeof(buf),
       "{\"title\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"vol\":%u,\"br\":%lu,"
       "\"bufpct\":%lu,\"bufsec\":%.1f,\"url\":\"%s\","
-      "\"bass\":%.0f,\"mid\":%.0f,\"treble\":%.0f}",
+      "\"bass\":%.0f,\"mid\":%.0f,\"treble\":%.0f,\"makeup\":%.1f}",
       jsonEscape(nowPlaying).c_str(),
       WiFi.localIP().toString().c_str(), WiFi.RSSI(), volumeStep,
       nowBitrate / 1000, sz ? f * 100 / sz : 0, f / 16000.0,
-      jsonEscape(cfgUrl).c_str(), cfgBass, cfgMid, cfgTreble);
+      jsonEscape(cfgUrl).c_str(), cfgBass, cfgMid, cfgTreble, toneMakeupDb());
     r->send(200, "application/json", buf);
   });
 
@@ -524,8 +592,9 @@ void setup() {
 
   // Set volume before connecting, so the radio comes up at whatever the
   // slider is physically set to rather than blasting at full.
-  audio.setVolume(volumeStep);
-  Serial.printf("volume: %u/%u at power-on\n", volumeStep, VOLUME_STEPS);
+  applyVolume();
+  Serial.printf("volume: %u/%u at power-on (tone makeup %+.1f dB)\n",
+                volumeStep, VOLUME_STEPS, toneMakeupDb());
 
   if (connectWiFi(20000)) {
     startMDNS();

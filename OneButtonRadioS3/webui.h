@@ -88,6 +88,12 @@ button.sec{background:#2c2c24;color:#c9c6bb}
 .bar{height:6px;background:#2c2c24;border-radius:3px;overflow:hidden;margin-top:6px}
 .bar i{display:block;height:100%;background:#639922;width:0;transition:width .4s}
 .hint{font-size:12px;color:#77756c;margin:6px 0 0}
+.presets{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:14px}
+.presets button{margin:0;padding:9px 4px;font-size:13px;background:#2c2c24;
+ color:#c9c6bb;border-radius:7px;white-space:nowrap;overflow:hidden;
+ text-overflow:ellipsis}
+.presets button.on{background:#639922;color:#fff}
+@media(max-width:400px){.presets{grid-template-columns:repeat(2,1fr)}}
 </style></head><body><div class="w">
 <h1>naani radio</h1>
 <p class="title" id="t">…</p>
@@ -97,9 +103,9 @@ button.sec{background:#2c2c24;color:#c9c6bb}
 <div class="row"><label>Bass</label><input type="range" id="b" min="-12" max="12" step="1" value="0"><span class="v" id="bv">0 dB</span></div>
 <div class="row"><label>Mid</label><input type="range" id="d" min="-12" max="12" step="1" value="0"><span class="v" id="dv">0 dB</span></div>
 <div class="row"><label>Treble</label><input type="range" id="h" min="-12" max="12" step="1" value="0"><span class="v" id="hv">0 dB</span></div>
-<button class="sec" onclick="flat()">Flat</button>
-<p class="hint">Boosting costs headroom — on a small speaker, cutting a band you
-dislike usually sounds better than boosting one you want.</p>
+<div class="presets" id="pp"></div>
+<p class="hint">Overall loudness is held steady as you adjust, so these change
+tone only. Compensation now: <span id="mk">0.0 dB</span>.</p>
 
 <h2>Buffer</h2>
 <div class="bar"><i id="bf"></i></div>
@@ -120,8 +126,16 @@ function push(){touched=true;
  fetch('/tone',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:`bass=${$('b').value}&mid=${$('d').value}&treble=${$('h').value}`})}
 ['b','d','h'].forEach(i=>{$(i).oninput=()=>{
- $(i+'v').textContent=fmt(+$(i).value);touched=true};$(i).onchange=push});
-function flat(){$('b').value=0;$('d').value=0;$('h').value=0;push()}
+ $(i+'v').textContent=fmt(+$(i).value);touched=true;mark()};$(i).onchange=push});
+let PRE=[];
+function setTone(b,m,t){$('b').value=b;$('d').value=m;$('h').value=t;push();mark()}
+function mark(){const b=+$('b').value,m=+$('d').value,t=+$('h').value;
+ [...document.querySelectorAll('#pp button')].forEach((el,i)=>
+  el.classList.toggle('on',PRE[i].b===b&&PRE[i].m===m&&PRE[i].t===t))}
+fetch('/presets').then(r=>r.json()).then(j=>{PRE=j;
+ const c=$('pp');c.innerHTML='';
+ j.forEach(p=>{const el=document.createElement('button');el.textContent=p.n;
+  el.onclick=()=>setTone(p.b,p.m,p.t);c.appendChild(el)});mark()})
 function setUrl(){const u=$('u').value.trim();if(!u)return;
  fetch('/station',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
   body:'url='+encodeURIComponent(u)})}
@@ -132,7 +146,8 @@ function poll(){fetch('/status').then(r=>r.json()).then(j=>{
  $('bt').textContent=`${j.bufpct}% — ${j.bufsec.toFixed(1)} s of audio banked`;
  if(!touched){$('b').value=j.bass;$('d').value=j.mid;$('h').value=j.treble;
   $('bv').textContent=fmt(j.bass);$('dv').textContent=fmt(j.mid);
-  $('hv').textContent=fmt(j.treble);}
+  $('hv').textContent=fmt(j.treble);mark();}
+ $('mk').textContent=(j.makeup>0?'+':'')+j.makeup.toFixed(1)+' dB';
  if(document.activeElement!==$('u'))$('u').value=j.url;
 }).catch(()=>{}).finally(()=>setTimeout(poll,2000))}
 poll();

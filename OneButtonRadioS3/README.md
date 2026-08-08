@@ -396,7 +396,22 @@ reboots or drops the connection.
 
 ### Normal mode
 
-- **Tone** — bass/mid/treble sliders, −12…+12 dB, applied live and saved
+- **Tone** — bass/mid/treble sliders, −12…+12 dB, applied live and saved, plus
+  eight presets (Flat, Speech, Warm, Bright, Bass boost, Small spkr, Late night,
+  Loudness). The active preset highlights itself when the sliders match it.
+- **Loudness is held constant across tone changes.** Boosting a band raises the
+  overall level, so without compensation the EQ doubles as a second volume control.
+  The sketch estimates the broadband level change as a perceptual weighted sum
+  (`0.30·bass + 0.45·mid + 0.25·treble` — mids weighted highest because the ear is
+  most sensitive around 1–4 kHz) and offsets the volume by its negative. The weights
+  sum to 1.0, so a uniform +6 dB across all three returns exactly −6 dB and cancels.
+  The page shows the compensation currently applied.
+
+  Because the volume curve is `dB = 33.22·log10(t)`, a C dB offset is just scaling
+  `t` by `10^(C/33.22)` — the curve itself is untouched. One real limit: a large cut
+  cannot be fully made up when the slider is already at maximum, since you cannot
+  amplify past full scale. The other direction always works, and a boost pulling the
+  volume down is exactly the headroom you need in order not to clip.
 - **Buffer** — fill percentage and seconds of audio banked. This is the number that
   matters if audio ever misbehaves again; see §7c
 - **Station** — change the stream URL. Applied immediately, no reboot
