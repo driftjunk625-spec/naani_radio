@@ -155,6 +155,10 @@ static const uint8_t VOLUME_STEPS = 100;
 // proper fix if this ever proves marginal - see README section 7.
 static const uint32_t POLL_MS = 500;
 
+// Rate used for a few seconds after the slider moves, so adjusting feels
+// immediate. Brief, and only while someone is actually turning it.
+static const uint32_t POLL_FAST_MS = 120;
+
 // Periodic diagnostics, off by default. Set to 1 to get a stats line every 2s
 // (buffer fill, RSSI, heap, loop rate, decoder resyncs, setVolume calls).
 #define DIAG 0
@@ -173,6 +177,7 @@ static float    volumeFiltered  = 0.0f;
 static float    volumeAnchor    = -9999.0f;  // ADC value when volumeStep was last set
 static uint8_t  volumeStep      = 0;
 static uint32_t lastVolumePoll  = 0;
+static uint32_t volumeFastUntil = 0;  // poll fast until this millis()
 static uint32_t lastStreamCheck = 0;
 static uint32_t reconnectDelay  = 2000;  // grows on repeated failure
 
@@ -361,14 +366,30 @@ static void applyVolume() {
 }
 
 static void pollVolume() {
-  if (millis() - lastVolumePoll < POLL_MS) return;
+  // Poll quickly for a few seconds after the slider actually moves, then fall
+  // back to the slow idle rate. Extra ADC reads only happen while someone is
+  // adjusting, so the WiFi disturbance that caused the stuttering stays away
+  // during normal listening.
+  uint32_t interval = (millis() < volumeFastUntil) ? POLL_FAST_MS : POLL_MS;
+  if (millis() - lastVolumePoll < interval) return;
   lastVolumePoll = millis();
 
   int raw = analogRead(PIN_VOLUME);
+  const float stepSpan = (float)(ADC_HIGH - ADC_LOW) / VOLUME_STEPS;
 
-  // Exponential moving average. The S3 ADC jitters by tens of counts sitting
-  // still, which would otherwise make the volume chatter between steps.
-  volumeFiltered += 0.2f * (raw - volumeFiltered);
+  // Fast attack, slow decay. A deliberate slider move is far bigger than ADC
+  // noise, so snap straight to it; only idle jitter gets the slow average.
+  //
+  // The old unconditional average was the real source of the lag: at 0.2 per
+  // reading it takes ~14 polls to cover 95% of a change, which at the 500ms
+  // idle rate is about seven seconds. Polling rate was only half a second of
+  // that, so slowing the ADC was never what made the control feel sluggish.
+  if (fabsf(raw - volumeFiltered) > stepSpan * 2.0f) {
+    volumeFiltered = raw;
+    volumeFastUntil = millis() + 3000;
+  } else {
+    volumeFiltered += 0.2f * (raw - volumeFiltered);
+  }
 
   // Hysteresis. One volume step spans (ADC_HIGH-ADC_LOW)/VOLUME_STEPS = ~38
   // ADC counts, and the residual noise after smoothing is comparable, so a
@@ -376,7 +397,6 @@ static void pollVolume() {
   // 5-18 setVolume() calls per second with the slider untouched. Requiring
   // three quarters of a step of real movement before acting silences that
   // without any perceptible loss of resolution.
-  const float stepSpan = (float)(ADC_HIGH - ADC_LOW) / VOLUME_STEPS;
   if (fabsf(volumeFiltered - volumeAnchor) < stepSpan * 0.75f) return;
 
   uint8_t step = adcToStep(volumeFiltered);
