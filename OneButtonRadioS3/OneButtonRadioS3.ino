@@ -58,14 +58,26 @@ static const char *AP_SSID = "naani-radio-setup";
 const char *STATION_URL = "https://radioindia.net/radio/sharda/icecast.audio";
 const char *STATION_REFERER = "https://onlineradiofm.in/";
 
-// Same station via voscast. Plain HTTP, no Referer needed, but only 1%
-// throughput headroom - it stutters. Kept for reference only. Note the
-// "/stream" path is load-bearing there: the library sends a Chrome
-// user-agent, so a bare "http://host:7738/" makes SHOUTcast DNAS v2 assume a
-// browser and 302 to its web admin page, and the stream reconnect-loops.
-// Confirmed the same broadcast by cross-correlating 30s of each feed: a
-// single sharp peak of 0.64 at -11.4s lag.
-// const char *STATION_URL = "http://s8.voscast.com:7738/stream";
+// Automatic fallback: the same station via the voscast mirror, plain HTTP and
+// no Referer needed. Used only after the configured URL fails repeatedly.
+//
+// This exists because the primary became unreachable from one particular
+// network - ports 80 and 443 both timing out from there while working fine
+// elsewhere - and the radio just reconnect-looped in silence. Reachability is
+// per-path, not global, so "the server is up" is not the same as "this radio
+// can reach it". For something meant to sit in someone else's house and just
+// work, one unreachable server should not mean no radio.
+//
+// It has less throughput headroom than the primary (see §7c), so expect it to
+// be more stutter-prone; that is still better than silence. The "/stream" path
+// is load-bearing here: the library sends a Chrome user-agent, so a bare
+// "http://host:7738/" makes SHOUTcast DNAS v2 assume a browser and 302 to its
+// web admin page. Confirmed the same broadcast by cross-correlating 30s of
+// each feed: a single sharp peak of 0.64 at -11.4s lag.
+const char *FALLBACK_URL = "http://s8.voscast.com:7738/stream";
+
+// Consecutive failures on the configured URL before falling back.
+static const uint8_t FAILS_BEFORE_FALLBACK = 3;
 
 // I2S pins to the MAX98357A. GPIO 4/5/6/7 are adjacent on the header, so
 // the amp wiring is one tidy run.
@@ -170,6 +182,11 @@ static const int MAX_SCAN = 20;
 static struct { char ssid[33]; int32_t rssi; bool open; } scanList[MAX_SCAN];
 static int scanCount = 0;
 static uint32_t lastApRetry = 0;
+
+// Fallback state. usingFallback is runtime-only and never persisted, so a
+// reboot always retries the station the user actually configured.
+static uint8_t streamFailures = 0;
+static bool    usingFallback  = false;
 static String nowPlaying;          // latest ICY stream title
 static uint32_t nowBitrate = 0;
 static volatile bool pendingReboot = false;
@@ -390,13 +407,29 @@ static bool connectWiFi(uint32_t timeoutMs) {
 
 static void startStream() {
   setStatus(ST_STREAM);
-  Serial.printf("stream: connecting to %s\n", cfgUrl.c_str());
-  if (audio.connecttohost(cfgUrl.c_str())) {
+
+  const char *url = usingFallback ? FALLBACK_URL : cfgUrl.c_str();
+  Serial.printf("stream: connecting to %s%s\n", url, usingFallback ? "  (fallback)" : "");
+
+  if (audio.connecttohost(url)) {
     reconnectDelay = 2000;
+    streamFailures = 0;
     setStatus(ST_PLAYING);
-  } else {
-    Serial.println("stream: connect failed");
-    setStatus(ST_ERROR);
+    return;
+  }
+
+  Serial.println("stream: connect failed");
+  setStatus(ST_ERROR);
+
+  // After enough consecutive failures assume the server is down rather than
+  // the network being briefly unhappy, and switch to the mirror. The saved
+  // URL is deliberately NOT overwritten - this is a runtime substitution, so
+  // a reboot goes back to trying the station the user actually chose.
+  if (!usingFallback && ++streamFailures >= FAILS_BEFORE_FALLBACK) {
+    usingFallback = true;
+    streamFailures = 0;
+    Serial.printf("stream: %u failures, falling back to %s\n",
+                  FAILS_BEFORE_FALLBACK, FALLBACK_URL);
   }
 }
 
@@ -468,6 +501,8 @@ static void startWebServer() {
     if (!r->hasParam("url", true)) { r->send(400, "text/plain", "url required"); return; }
     cfgUrl = r->getParam("url", true)->value();
     saveUrl(cfgUrl);
+    usingFallback = false;      // a deliberate choice deserves a fresh try
+    streamFailures = 0;
     r->send(200, "application/json", "{\"ok\":true}");
     pendingRetune = true;      // reconnect from loop()
   });
@@ -490,11 +525,12 @@ static void startWebServer() {
     snprintf(buf, sizeof(buf),
       "{\"title\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"vol\":%u,\"br\":%lu,"
       "\"bufpct\":%lu,\"bufsec\":%.1f,\"url\":\"%s\","
-      "\"bass\":%.0f,\"mid\":%.0f,\"treble\":%.0f,\"makeup\":%.1f}",
+      "\"bass\":%.0f,\"mid\":%.0f,\"treble\":%.0f,\"makeup\":%.1f,\"fb\":%d}",
       jsonEscape(nowPlaying).c_str(),
       WiFi.localIP().toString().c_str(), WiFi.RSSI(), volumeStep,
       nowBitrate / 1000, sz ? f * 100 / sz : 0, f / 16000.0,
-      jsonEscape(cfgUrl).c_str(), cfgBass, cfgMid, cfgTreble, toneMakeupDb());
+      jsonEscape(cfgUrl).c_str(), cfgBass, cfgMid, cfgTreble, toneMakeupDb(),
+      usingFallback ? 1 : 0);
     r->send(200, "application/json", buf);
   });
 
