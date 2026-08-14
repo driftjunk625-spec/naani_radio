@@ -162,6 +162,14 @@ static float  cfgBass, cfgMid, cfgTreble;
 
 static AsyncWebServer server(80);
 static bool   apMode = false;
+
+// Networks found by the single scan taken before the SoftAP is raised. Held in
+// a fixed array rather than re-scanning on demand, because scanning while the
+// AP is up breaks the AP - see startAP().
+static const int MAX_SCAN = 20;
+static struct { char ssid[33]; int32_t rssi; bool open; } scanList[MAX_SCAN];
+static int scanCount = 0;
+static uint32_t lastApRetry = 0;
 static String nowPlaying;          // latest ICY stream title
 static uint32_t nowBitrate = 0;
 static volatile bool pendingReboot = false;
@@ -417,21 +425,19 @@ static void startWebServer() {
     r->send_P(200, "text/html", apMode ? PAGE_SETUP : PAGE_MAIN);
   });
 
-  // Async scan, so the handler never blocks waiting for the radio.
+  // Serves the list captured BEFORE the SoftAP came up. Never scans while the
+  // portal is live: a STA scan makes the radio hop channels, which knocks the
+  // SoftAP off its own channel and leaves it visible but unjoinable. That is
+  // exactly the bug this replaces.
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *r) {
-    int n = WiFi.scanComplete();
-    if (n == WIFI_SCAN_FAILED) { WiFi.scanNetworks(true); n = WIFI_SCAN_RUNNING; }
-    if (n == WIFI_SCAN_RUNNING) { r->send(200, "application/json", "{\"done\":false}"); return; }
-
     String j = "{\"done\":true,\"nets\":[";
-    for (int i = 0; i < n && i < 20; i++) {
+    for (int i = 0; i < scanCount; i++) {
       if (i) j += ',';
-      j += "{\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\",\"rssi\":" + WiFi.RSSI(i) +
-           ",\"open\":" + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false") + "}";
+      j += "{\"ssid\":\"" + jsonEscape(String(scanList[i].ssid)) +
+           "\",\"rssi\":" + String(scanList[i].rssi) +
+           ",\"open\":" + (scanList[i].open ? "true" : "false") + "}";
     }
     j += "]}";
-    WiFi.scanDelete();
-    WiFi.scanNetworks(true);   // refresh for next time
     r->send(200, "application/json", j);
   });
 
@@ -511,15 +517,75 @@ static void startMDNS() {
   }
 }
 
+// One blocking scan, taken while the AP is NOT running, cached for the portal.
+static void scanOnce() {
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks(false, false);
+  scanCount = 0;
+  for (int i = 0; i < n && scanCount < MAX_SCAN; i++) {
+    String s = WiFi.SSID(i);
+    if (s.isEmpty()) continue;
+    strncpy(scanList[scanCount].ssid, s.c_str(), 32);
+    scanList[scanCount].ssid[32] = '\0';
+    scanList[scanCount].rssi = WiFi.RSSI(i);
+    scanList[scanCount].open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+    scanCount++;
+  }
+  WiFi.scanDelete();
+  Serial.printf("scan: %d networks cached\n", scanCount);
+}
+
 // No network could be joined - raise the setup portal instead of sitting dark.
+//
+// Deliberately AP-only, with STA fully disconnected first. Two things break a
+// SoftAP: a STA scan, and a STA still retrying association to credentials that
+// do not work. Both make the radio hop channels, and the AP then shows up in
+// the network list but refuses to accept clients. Scan first, then go AP-only
+// and leave the radio alone.
 static void startAP() {
   apMode = true;
   setStatus(ST_AP);
-  WiFi.mode(WIFI_AP_STA);          // AP_STA so scanning still works
+
+  WiFi.disconnect(true);   // stop STA retrying the failed credentials
+  scanOnce();              // scan while there is no AP to disturb
+
+  WiFi.mode(WIFI_AP);      // AP only - nothing else touching the radio
   WiFi.softAP(AP_SSID);
-  WiFi.scanNetworks(true);         // kick off an async scan for the dropdown
+  lastApRetry = millis();
   Serial.printf("ap: '%s' at http://%s\n", AP_SSID,
                 WiFi.softAPIP().toString().c_str());
+}
+
+// Periodically re-try the saved network while the portal is up, so a router
+// that was simply slow to boot does not strand the radio in setup mode
+// forever. Skipped while someone is actually connected to the portal, since
+// the STA attempt would disrupt the AP they are using.
+static bool retrySavedNetwork() {
+  if (cfgSsid.isEmpty()) return false;
+  if (WiFi.softAPgetStationNum() > 0) return false;   // portal in use, leave it alone
+
+  Serial.printf("ap: retrying '%s'\n", cfgSsid.c_str());
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) delay(200);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("ap: joined, ip %s - dropping portal\n",
+                  WiFi.localIP().toString().c_str());
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    apMode = false;
+    startMDNS();
+    startStream();
+    return true;
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);     // back to AP-only so the portal stays joinable
+  return false;
 }
 
 // ------------------------------------------------------------------ main
@@ -625,8 +691,14 @@ void loop() {
     startStream();
   }
 
-  // In setup mode there is no stream to service; just keep the portal alive.
+  // In setup mode there is no stream to service - keep the portal alive, and
+  // every 30 s have another go at the saved network so a router that was slow
+  // to boot recovers on its own instead of stranding the radio here.
   if (apMode) {
+    if (millis() - lastApRetry > 30000) {
+      lastApRetry = millis();
+      retrySavedNetwork();
+    }
     delay(10);
     return;
   }

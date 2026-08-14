@@ -425,7 +425,20 @@ sitting dark. The status LED goes **magenta** so this state is visible without a
 serial cable.
 
 Join it, open any address, pick a network from the scanned list (or type it), enter
-the password, and it saves and reboots. The AP is open on purpose: it exists only to
+the password, and it saves and reboots.
+
+**The scan happens before the AP is raised, and never again while it is up.** A STA
+scan makes the radio hop channels, which knocks the SoftAP off its own channel - the
+AP stays visible but refuses clients ("could not be joined"). A STA still retrying
+failed credentials does the same. So `startAP()` disconnects STA, scans once, caches
+the result, and then goes AP-only; `/scan` just serves that cache.
+
+**It retries the saved network every 30 s while the portal is up**, so a router that
+was merely slow to boot recovers on its own rather than stranding the radio in setup
+mode forever. The retry is skipped whenever a client is connected to the portal, since
+the STA attempt would disrupt the very AP being used. One consequence: if no one is
+connected, there is a ~10 s window every 30 s where the AP is briefly busy - if a join
+fails, simply try again. The AP is open on purpose: it exists only to
 hand over credentials, and a password you'd have to look up defeats the point of a
 recovery portal. It is only up while the radio is unconfigured.
 
