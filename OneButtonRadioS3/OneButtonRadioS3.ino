@@ -79,6 +79,31 @@ const char *FALLBACK_URL = "http://s8.voscast.com:7738/stream";
 // Consecutive failures on the configured URL before falling back.
 static const uint8_t FAILS_BEFORE_FALLBACK = 3;
 
+// WiFi networks, compiled in from secrets.h and always winning over anything
+// saved on the chip. This radio is an appliance: it sits in one place and
+// joins one access point, forever, with nobody around to reconfigure it. A
+// wiped or corrupted NVS must still come up on the right network.
+struct Net { const char *ssid; const char *pass; };
+static const Net NETWORKS[] = {
+  { WIFI_SSID,  WIFI_PASS  },
+  { WIFI_SSID2, WIFI_PASS2 },   // optional backup; empty SSID is skipped
+};
+static const size_t N_NETWORKS = sizeof(NETWORKS) / sizeof(NETWORKS[0]);
+
+// How long to keep quietly retrying before bothering to raise the setup
+// portal. A router reboot takes 60-90s, so 20s (the old behaviour) stranded
+// the radio during an outage that would have fixed itself. Five minutes means
+// an ordinary outage is never visible as anything but silence.
+static const uint32_t PORTAL_AFTER_MS = 5UL * 60UL * 1000UL;
+
+// Seconds between reconnect attempts while offline.
+static const uint32_t WIFI_RETRY_MS = 10000;
+
+// Last-resort watchdog. Firmware can wedge without crashing - a socket that
+// never times out, a driver in a bad state. On a desk you power-cycle it; in
+// someone's house nobody will. If nothing has played for this long, reboot.
+static const uint32_t WATCHDOG_MS = 15UL * 60UL * 1000UL;
+
 // I2S pins to the MAX98357A. GPIO 4/5/6/7 are adjacent on the header, so
 // the amp wiring is one tidy run.
 //
@@ -185,6 +210,10 @@ static uint32_t lastApRetry = 0;
 
 // Fallback state. usingFallback is runtime-only and never persisted, so a
 // reboot always retries the station the user actually configured.
+static size_t   netIndex     = 0;   // network that worked last
+static uint32_t offlineSince = 0;   // millis() when we first lost the network
+static uint32_t lastWifiTry  = 0;
+static uint32_t lastGoodMs   = 0;   // last time audio was actually running
 static uint8_t streamFailures = 0;
 static bool    usingFallback  = false;
 static String nowPlaying;          // latest ICY stream title
@@ -194,8 +223,12 @@ static volatile bool pendingRetune = false;
 
 static void loadConfig() {
   prefs.begin("naani", true);                       // read-only
-  cfgSsid   = prefs.getString("ssid", WIFI_SSID);   // secrets.h is the fallback
-  cfgPass   = prefs.getString("pass", WIFI_PASS);
+  // Empty by default, NOT the compiled SSID. Anything saved through the setup
+  // portal is tried IN ADDITION to the hardcoded networks, never instead of
+  // them - so a stale or wrong entry here can never stop the radio reaching
+  // its real access point. This removes the override trap entirely.
+  cfgSsid   = prefs.getString("ssid", "");
+  cfgPass   = prefs.getString("pass", "");
   cfgUrl    = prefs.getString("url",  STATION_URL);
   cfgBass   = prefs.getFloat("bass",   TONE_BASS);
   cfgMid    = prefs.getFloat("mid",    TONE_MID);
@@ -380,29 +413,61 @@ static void reportDiag() {
 }
 #endif
 
-static bool connectWiFi(uint32_t timeoutMs) {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  if (cfgSsid.isEmpty()) return false;
+// Try one network. Amber throughout, because reconnecting is an ordinary
+// expected state, not a fault - this radio lives with someone who cannot be
+// asked to interpret an error colour.
+static bool tryNetwork(const Net &n, uint32_t timeoutMs) {
+  if (!n.ssid || !n.ssid[0]) return false;
 
   setStatus(ST_WIFI);
-  Serial.printf("wifi: connecting to %s\n", cfgSsid.c_str());
-  WiFi.mode(WIFI_STA);
+  Serial.printf("wifi: trying '%s'\n", n.ssid);
+  WiFi.mode(apMode ? WIFI_AP_STA : WIFI_STA);
   WiFi.setSleep(false);  // modem sleep causes audible stream dropouts
-  WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+  WiFi.begin(n.ssid, n.pass);
 
   uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
-    delay(200);
-  }
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) delay(200);
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("wifi: ok, ip %s, rssi %d dBm\n",
+    Serial.printf("wifi: ok on '%s', ip %s, rssi %d dBm\n", n.ssid,
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
     return true;
   }
-  Serial.println("wifi: failed");
-  setStatus(ST_ERROR);
+
+  WiFi.disconnect(true);
   return false;
+}
+
+// Walk the network list, starting from whichever one worked last so the usual
+// case is a single attempt. Returns false only when every network failed.
+static bool connectAny(uint32_t perNetMs) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  for (size_t i = 0; i < N_NETWORKS; i++) {
+    size_t idx = (netIndex + i) % N_NETWORKS;
+    if (tryNetwork(NETWORKS[idx], perNetMs)) { netIndex = idx; return true; }
+  }
+
+  // Then anything added through the setup portal, as an extra option only.
+  if (!cfgSsid.isEmpty()) {
+    Net extra = { cfgSsid.c_str(), cfgPass.c_str() };
+    if (tryNetwork(extra, perNetMs)) return true;
+  }
+
+  Serial.println("wifi: no network reachable, will keep trying");
+  return false;
+}
+
+// Everything that has to happen once a network is joined.
+static void onNetworkUp() {
+  offlineSince = 0;
+  if (apMode) {                       // portal was up; take it down again
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    apMode = false;
+    Serial.println("ap: network returned, portal down");
+  }
+  startMDNS();
 }
 
 static void startStream() {
@@ -599,38 +664,6 @@ static void startAP() {
                 WiFi.softAPIP().toString().c_str());
 }
 
-// Periodically re-try the saved network while the portal is up, so a router
-// that was simply slow to boot does not strand the radio in setup mode
-// forever. Skipped while someone is actually connected to the portal, since
-// the STA attempt would disrupt the AP they are using.
-static bool retrySavedNetwork() {
-  if (cfgSsid.isEmpty()) return false;
-  if (WiFi.softAPgetStationNum() > 0) return false;   // portal in use, leave it alone
-
-  Serial.printf("ap: retrying '%s'\n", cfgSsid.c_str());
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) delay(200);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("ap: joined, ip %s - dropping portal\n",
-                  WiFi.localIP().toString().c_str());
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    apMode = false;
-    startMDNS();
-    startStream();
-    return true;
-  }
-
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_AP);     // back to AP-only so the portal stays joinable
-  return false;
-}
-
 // ------------------------------------------------------------------ main
 
 void setup() {
@@ -705,16 +738,17 @@ void setup() {
   Serial.printf("volume: %u/%u at power-on (tone makeup %+.1f dB)\n",
                 volumeStep, VOLUME_STEPS, toneMakeupDb());
 
-  if (connectWiFi(20000)) {
-    startMDNS();
+  lastGoodMs = millis();          // watchdog counts from boot
+
+  if (connectAny(15000)) {
+    onNetworkUp();
     startWebServer();
     startStream();
   } else {
-    // No usable credentials, or the saved network is gone. Rather than sit
-    // dark, raise a setup portal so the radio can be reconfigured without a
-    // laptop and a USB cable.
-    startAP();
-    startMDNS();        // naani.local resolves on the AP too
+    // Deliberately do NOT raise the portal here. After a power cut the router
+    // is booting too, and giving up at 20s stranded the radio in setup mode
+    // during an outage that would have healed itself. loop() keeps trying.
+    offlineSince = millis();
     startWebServer();
   }
 }
@@ -734,13 +768,32 @@ void loop() {
     startStream();
   }
 
-  // In setup mode there is no stream to service - keep the portal alive, and
-  // every 30 s have another go at the saved network so a router that was slow
-  // to boot recovers on its own instead of stranding the radio here.
-  if (apMode) {
-    if (millis() - lastApRetry > 30000) {
-      lastApRetry = millis();
-      retrySavedNetwork();
+  // Watchdog. Reboot if nothing has actually played for a long time - covers
+  // wedged states that are not crashes and that nobody is present to clear.
+  if (audio.isRunning()) lastGoodMs = millis();
+  if (millis() - lastGoodMs > WATCHDOG_MS) {
+    Serial.println("watchdog: no audio for 15 min, restarting");
+    delay(100);
+    ESP.restart();
+  }
+
+  // Offline: keep trying the configured networks forever. This is the whole
+  // point - the radio must heal itself without anyone touching it.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!offlineSince) offlineSince = millis();
+
+    if (millis() - lastWifiTry > WIFI_RETRY_MS) {
+      lastWifiTry = millis();
+
+      if (connectAny(12000)) {
+        onNetworkUp();
+        startStream();
+      } else if (!apMode && millis() - offlineSince > PORTAL_AFTER_MS) {
+        // Only now, after five minutes of nothing, offer the portal - and
+        // carry on retrying the real networks underneath it.
+        Serial.println("wifi: offline 5 min, raising setup portal");
+        startAP();
+      }
     }
     delay(10);
     return;
@@ -770,12 +823,9 @@ void loop() {
   if (millis() - lastStreamCheck > reconnectDelay) {
     lastStreamCheck = millis();
 
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("wifi: lost, retrying");
-      WiFi.disconnect();
-      if (connectWiFi(15000)) startStream();
-      reconnectDelay = min(reconnectDelay * 2, (uint32_t)30000);
-    } else if (!audio.isRunning()) {
+    // WiFi loss is handled above, which returns early - by here we are
+    // definitely connected.
+    if (!audio.isRunning()) {
       Serial.println("stream: not running, reconnecting");
       startStream();   // owns its own backoff now
     } else {

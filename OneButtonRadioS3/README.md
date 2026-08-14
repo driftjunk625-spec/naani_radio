@@ -417,6 +417,30 @@ reboots or drops the connection.
 - **Station** — change the stream URL. Applied immediately, no reboot
 - Live stream title, IP, RSSI, volume and bitrate, polled every 2 s
 
+### Connection policy — this is an appliance
+
+The radio is for an elderly user with nobody around to reconfigure it, so the
+defaults favour self-healing over flexibility.
+
+- **Networks are compiled in** (`secrets.h`), tried in order, and always win. A
+  wiped or corrupted NVS still comes up on the right access point. Changing
+  network means editing two lines and reflashing - deliberately.
+- **A second network is optional** (`WIFI_SSID2`). Leave it empty to disable.
+  Useful as a phone-hotspot backup if the main AP dies while nobody is home.
+- **Anything saved through the portal is ADDITIVE**, never an override - it is
+  tried after the compiled networks. A stale entry there can no longer stop the
+  radio reaching its real access point. That override was the trap that made
+  editing `secrets.h` appear to do nothing.
+- **It retries forever.** Boot no longer gives up after 20 s. A router reboot
+  takes 60-90 s, which used to strand the radio in setup mode during an outage
+  that would have healed itself.
+- **The portal is a last resort**, raised only after 5 minutes offline, and the
+  real networks keep being retried underneath it. In an ordinary outage nobody
+  ever sees it.
+- **A watchdog reboots** if nothing has played for 15 minutes, covering wedged
+  states that are not crashes and that nobody is present to power-cycle.
+- **Amber means reconnecting** - a calm, expected state. Magenta is now rare.
+
 ### Setup portal (AP mode)
 
 If no network can be joined at boot — no saved credentials, or the saved network is
