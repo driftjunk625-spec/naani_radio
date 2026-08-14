@@ -421,16 +421,23 @@ static void startStream() {
   Serial.println("stream: connect failed");
   setStatus(ST_ERROR);
 
-  // After enough consecutive failures assume the server is down rather than
-  // the network being briefly unhappy, and switch to the mirror. The saved
-  // URL is deliberately NOT overwritten - this is a runtime substitution, so
-  // a reboot goes back to trying the station the user actually chose.
+  // After enough consecutive failures assume the server is unreachable from
+  // here rather than the network being briefly unhappy, and switch to the
+  // mirror. The saved URL is deliberately NOT overwritten - this is a runtime
+  // substitution, so a reboot goes back to the station the user chose.
   if (!usingFallback && ++streamFailures >= FAILS_BEFORE_FALLBACK) {
     usingFallback = true;
     streamFailures = 0;
     Serial.printf("stream: %u failures, falling back to %s\n",
                   FAILS_BEFORE_FALLBACK, FALLBACK_URL);
+    // Try the new target straight away. Backing off here would make us sit
+    // out a delay computed for the strategy we just abandoned, which on a
+    // slow link added most of a minute before any audio appeared.
+    reconnectDelay = 500;
+    return;
   }
+
+  reconnectDelay = min(reconnectDelay * 2, (uint32_t)30000);
 }
 
 // -------------------------------------------------------------- web server
@@ -770,8 +777,7 @@ void loop() {
       reconnectDelay = min(reconnectDelay * 2, (uint32_t)30000);
     } else if (!audio.isRunning()) {
       Serial.println("stream: not running, reconnecting");
-      startStream();
-      reconnectDelay = min(reconnectDelay * 2, (uint32_t)30000);
+      startStream();   // owns its own backoff now
     } else {
       setStatus(ST_PLAYING);
     }
