@@ -239,6 +239,32 @@ is the first thing to check.
 A known-good fallback for testing, left commented in the sketch:
 `http://ice1.somafm.com/groovesalad-128-mp3`
 
+### Flashing from the Arduino IDE
+
+`File → Open` the `.ino`, then `Tools → Board → esp32 → ESP32S3 Dev Module`, and
+set these. The first is not optional - build without OPI PSRAM and the audio
+library fails to allocate, which looks exactly like a board with no PSRAM:
+
+| Setting | Value |
+|---|---|
+| **PSRAM** | **OPI PSRAM** |
+| Flash Size | 16MB (128Mb) |
+| Partition Scheme | 16M Flash (3MB APP/9.9MB FATFS) |
+| USB CDC On Boot | Disabled |
+| Upload Speed | 921600 |
+
+Port is the **UART** USB-C socket (`/dev/cu.usbserial-*`), not the one marked
+`USB`. Serial Monitor at 115200.
+
+Three things that trip people up:
+
+- **"Port busy" on upload** - the Serial Monitor is holding the port. Close it.
+- **Errors about `PREFILL_BYTES` or `REFERER`** - a library reinstall wiped the
+  patches. Re-run `patches/prefill_patch.py`.
+- **Editing `secrets.h` appears to do nothing** - it cannot any more, since
+  compiled networks are tried first, but the serial log always prints which
+  SSID it is attempting.
+
 ### Watching the serial log
 
 `arduino-cli monitor` silently produces nothing when not attached to a TTY, and
