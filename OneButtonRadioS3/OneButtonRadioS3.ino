@@ -36,45 +36,49 @@ static const char *AP_SSID = "naani-radio-setup";
 
 // ---------------------------------------------------------------- config
 
-// Radio Sharda 90.4 FM, Jammu - 128 kbps MP3.
+// Radio Sharda 90.4 FM, Jammu - 128 kbps MP3, two routes to the same feed.
 //
-// Use the station's own feed, NOT the voscast mirror. This is a throughput
-// decision, not a preference.
+// Which one belongs first is a per-network question, not a global one. TCP
+// throughput here is capped at window/RTT: the receive window is a hard 5760
+// bytes (CONFIG_LWIP_TCP_WND_DEFAULT=5760, CONFIG_LWIP_WND_SCALE unset), so a
+// far-away server simply cannot deliver fast enough no matter how good the
+// WiFi is. Measured on three different networks the same two hosts gave
+// anywhere from +1% to +35% headroom against the 16.0 KB/s this stream needs.
 //
-// The ESP32's TCP receive window is a hard 5760 bytes: sdkconfig has
-// CONFIG_LWIP_TCP_WND_DEFAULT=5760 and CONFIG_LWIP_WND_SCALE unset, so it
-// cannot grow. TCP throughput is therefore capped at window/RTT, and both
-// servers are far away:
+// Rule of thumb when changing station or network: ping the host, and require
+// 5760/RTT comfortably above the bitrate in bytes/sec.
 //
-//   voscast     358ms RTT -> 16.1 KB/s  vs 16.0 KB/s needed = +1%  headroom
-//   radioindia  266ms RTT -> 21.6 KB/s  vs 16.0 KB/s needed = +35% headroom
+// PRIMARY: the voscast mirror. Plain HTTP, no Referer needed.
 //
-// With +1% the buffer can never refill: measured draining from 98KB to 17KB
-// (1.1s of audio) and then stuttering permanently. With +35% it climbed to
-// 453KB (28s) in 85s and kept going. That is the whole difference.
+// This is the right primary for THIS network. radioindia.net is simply not
+// routable from here - port 443 unreachable, verified independently of the
+// radio - so having it first meant three failed attempts and about fifteen
+// wasted seconds at every single power-on before the fallback took over.
 //
-// This feed is HTTPS-only (port 80 closed) and hotlink-protected - it 403s
-// without the Referer below, which needs patches/prefill_patch.py applied.
-const char *STATION_URL = "https://radioindia.net/radio/sharda/icecast.audio";
+// Headroom here is fine: voscast is 297ms away on this connection, giving
+// ~19.4 KB/s against the 16.0 needed, about +21%. That is the same server
+// that stuttered badly from a previous network at +1% - same host, different
+// route, completely different result. Measure, do not assume.
+//
+// The "/stream" path is load-bearing: the library sends a Chrome user-agent,
+// so a bare "http://host:7738/" makes SHOUTcast DNAS v2 assume a browser and
+// 302 to its web admin page.
+const char *STATION_URL = "http://s8.voscast.com:7738/stream";
 const char *STATION_REFERER = "https://onlineradiofm.in/";
 
-// Automatic fallback: the same station via the voscast mirror, plain HTTP and
-// no Referer needed. Used only after the configured URL fails repeatedly.
+// FALLBACK, tried only after the primary fails repeatedly.
 //
-// This exists because the primary became unreachable from one particular
-// network - ports 80 and 443 both timing out from there while working fine
-// elsewhere - and the radio just reconnect-looped in silence. Reachability is
-// per-path, not global, so "the server is up" is not the same as "this radio
-// can reach it". For something meant to sit in someone else's house and just
-// work, one unreachable server should not mean no radio.
+// Currently radioindia.net, which is the station's own feed and works well
+// from some networks - but is not routable at all from this one (port 443
+// unreachable, verified independently of the radio). Keeping it here costs
+// nothing and means the radio recovers by itself if it ever moves somewhere
+// that can reach it.
 //
-// It has less throughput headroom than the primary (see §7c), so expect it to
-// be more stutter-prone; that is still better than silence. The "/stream" path
-// is load-bearing here: the library sends a Chrome user-agent, so a bare
-// "http://host:7738/" makes SHOUTcast DNAS v2 assume a browser and 302 to its
-// web admin page. Confirmed the same broadcast by cross-correlating 30s of
-// each feed: a single sharp peak of 0.64 at -11.4s lag.
-const char *FALLBACK_URL = "http://s8.voscast.com:7738/stream";
+// It is HTTPS-only and hotlink-protected, so it needs the Referer above,
+// which requires patches/prefill_patch.py to have been applied. Confirmed the
+// same broadcast as the primary by cross-correlating 30s of each feed: a
+// single sharp peak of 0.64 at -11.4s lag.
+const char *FALLBACK_URL = "https://radioindia.net/radio/sharda/icecast.audio";
 
 // Consecutive failures on the configured URL before falling back.
 static const uint8_t FAILS_BEFORE_FALLBACK = 3;
